@@ -121,7 +121,7 @@ This port focuses on the **`apps_script` mode** which is the only one that relia
 - [x] Auto-blacklist failing scripts on 429 / quota errors (10-minute cooldown)
 - [x] Response cache (50 MB, FIFO + TTL, parses `Cache-Control: max-age`, heuristics for static assets)
 - [x] Request coalescing: concurrent identical GETs share one upstream fetch
-- [x] SNI-rewrite tunnels for YouTube / googlevideo / doubleclick / etc. — bypass the relay entirely and go direct to Google's edge with SNI=`front_domain`
+- [x] SNI-rewrite tunnels (direct-to-Google-edge bypassing the relay) for `google.com`, `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `fonts.googleapis.com`. Extra domains can be added via the `hosts` map in config — see "Known limitations" below.
 - [x] Automatic redirect handling on the relay (`/exec` → `googleusercontent.com`)
 - [x] Header filtering (strip connection-specific + brotli)
 - [x] `mhrv-rs test` subcommand — one-shot end-to-end relay probe
@@ -135,6 +135,22 @@ Intentionally NOT implemented (rationale included so future contributors don't s
 - [ ] **Request batching (`q:[...]` mode)** — our connection pool + tokio async already parallelizes well; batching adds ~200 lines of state management with unclear incremental gain over the current flow
 - [ ] **Range-based parallel download** — edge cases (non-Range servers, chunked mid-stream, content-encoding) are real; YouTube-style video already bypasses Apps Script via SNI-rewrite tunnel
 - [ ] **Other modes** (`domain_fronting`, `google_fronting`, `custom_domain`) — Cloudflare killed generic domain fronting in 2024; Cloud Run needs paid plan; skip unless specifically requested
+
+## Known limitations
+
+These are inherent to the Apps Script + domain-fronting approach, not bugs in this client. Same issues exist in the original Python version.
+
+- **User-Agent is fixed to `Google-Apps-Script`** for any request going through the relay. Google's `UrlFetchApp.fetch()` does not allow overriding it. Consequence: sites that detect bots (e.g., `google.com` search, some CAPTCHAs) will serve degraded / no-JavaScript fallback pages to relayed requests. Workaround: add the affected domain to the `hosts` map in `config.json` so it's routed via the SNI-rewrite tunnel (real browser UA) instead of the relay. `google.com`, `youtube.com`, `fonts.googleapis.com` are already done by default.
+
+- **Video playback is slow and quota-limited** for anything that goes through the relay. YouTube HTML loads via the tunnel (fast) but chunks from `googlevideo.com` go through Apps Script. Each Apps Script account has a ~2 million `UrlFetchApp` calls/day consumer quota and a 50 MB body limit per fetch. Fine for text browsing, painful for 1080p video. Use multiple `script_id`s in rotation for more headroom, or use a real VPN for video.
+
+- **Brotli compression is stripped** from forwarded `Accept-Encoding` headers. Apps Script can decompress gzip but not brotli; forwarding `br` would produce garbled responses. Gzip still works. Minor size overhead for responses that would've been brotli.
+
+- **WebSockets don't work** through Apps Script (the relay does single request/response JSON). Sites that upgrade to WS fail. This covers `chat.openai.com` streaming, Discord voice, etc.
+
+- **HTTPS sites your browser has pinned** (HSTS preloaded list, extended validation) will reject the MITM cert. Most sites work fine because we install our CA as trusted; a few hard-pinned ones won't.
+
+- **Google/YouTube 2FA / sensitive logins** may see "unrecognized device" warnings because the request originates from Google's Apps Script infrastructure IP, not your real IP. Log in via tunnel first (`google.com` is in the rewrite list) to avoid this.
 
 ## License
 
@@ -202,6 +218,20 @@ mhrv-rs.exe --install-cert
 #### ۶. تنظیم proxy در مرورگر
 
 Proxy مرورگر را روی `127.0.0.1:8085` بگذارید (هم HTTP و هم HTTPS).
+
+### محدودیت‌های شناخته‌شده
+
+این‌ها محدودیت‌های ذاتی روش Apps Script هستند، نه باگ در این کلاینت. نسخه اصلی Python هم همین مشکلات را دارد.
+
+- **User-Agent همیشه `Google-Apps-Script` است** برای هر درخواستی که از رله رد می‌شود. `UrlFetchApp.fetch()` گوگل اجازه تغییر این را نمی‌دهد. نتیجه: سایت‌هایی که ربات را تشخیص می‌دهند (مثل جست‌وجوی `google.com`، بعضی CAPTCHA‌ها) نسخه ساده بدون JS را سرو می‌کنند. راه‌حل: دامنه مورد نظر را به `hosts` در `config.json` اضافه کنید تا از مسیر SNI-rewrite (با UA واقعی مرورگر) بگذرد. `google.com`، `youtube.com`، `fonts.googleapis.com` از قبل در این لیست هستند.
+
+- **پخش ویدیو کند است و محدودیت سهمیه دارد** برای چیزهایی که از رله رد می‌شوند. صفحه HTML یوتوب از طریق تونل می‌آید (سریع)، ولی chunk‌های ویدیو از `googlevideo.com` از طریق Apps Script می‌آیند. هر اکانت Apps Script روزانه ~۲ میلیون فراخوانی و هر درخواست حداکثر ۵۰ مگابایت. برای متن مرور اوکی، برای ۱۰۸۰p دردناک. چند `script_id` بگذارید یا برای ویدیو از VPN واقعی استفاده کنید.
+
+- **فشرده‌سازی Brotli فیلتر می‌شود**. Apps Script gzip می‌تواند باز کند ولی brotli نه.
+
+- **WebSocket کار نمی‌کند** (رله تک‌درخواستی است). پیام‌رسان‌ها و استریم OpenAI chat روی این کار نمی‌کنند.
+
+- **ورود دومرحله‌ای گوگل/یوتوب** ممکن است "دستگاه ناشناس" بگوید چون درخواست از IP Apps Script می‌آید نه IP شما. اول با تونل (`google.com` در لیست است) لاگین کنید.
 
 ### اعتبار
 

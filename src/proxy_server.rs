@@ -16,11 +16,14 @@ use crate::mitm::MitmCertManager;
 
 // Domains that are served from Google's core frontend IP pool and therefore
 // respond correctly when we connect to `google_ip` with SNI=`front_domain`
-// and Host=<the real domain>. Kept conservative: anything on a separate CDN
-// (googlevideo, ytimg, doubleclick, etc.) is DROPPED because routing to the
-// wrong backend breaks rather than helps. Those fall through to the normal
-// MITM+relay path, where they'll work (slower) through Apps Script.
+// and Host=<the real domain>. Routing these via the tunnel instead of the
+// Apps Script relay also avoids Apps Script's fixed "Google-Apps-Script"
+// User-Agent, which makes Google serve the bot/no-JS fallback for search.
+// Kept conservative: anything on a separate CDN (googlevideo, ytimg,
+// doubleclick, etc.) is DROPPED because routing to the wrong backend breaks
+// rather than helps. Those fall through to MITM+relay (slower but works).
 const SNI_REWRITE_SUFFIXES: &[&str] = &[
+    "google.com",
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
