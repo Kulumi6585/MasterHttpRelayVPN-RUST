@@ -44,6 +44,8 @@ pub struct Config {
     pub listen_host: String,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    #[serde(default)]
+    pub socks5_port: Option<u16>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default = "default_verify_ssl")]

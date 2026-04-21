@@ -63,6 +63,7 @@ pub enum ProxyError {
 pub struct ProxyServer {
     host: String,
     port: u16,
+    socks5_port: u16,
     fronter: Arc<DomainFronter>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
@@ -101,9 +102,12 @@ impl ProxyServer {
             tls_connector,
         });
 
+        let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
+
         Ok(Self {
             host: config.listen_host.clone(),
             port: config.listen_port,
+            socks5_port,
             fronter: Arc::new(fronter),
             mitm,
             rewrite_ctx,
@@ -111,19 +115,24 @@ impl ProxyServer {
     }
 
     pub async fn run(self) -> Result<(), ProxyError> {
-        let addr = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr).await?;
+        let http_addr = format!("{}:{}", self.host, self.port);
+        let socks_addr = format!("{}:{}", self.host, self.socks5_port);
+        let http_listener = TcpListener::bind(&http_addr).await?;
+        let socks_listener = TcpListener::bind(&socks_addr).await?;
         tracing::warn!(
-            "Listening on {} — set your browser HTTP proxy to this address.",
-            addr
+            "Listening HTTP   on {} — set your browser HTTP proxy to this address.",
+            http_addr
+        );
+        tracing::warn!(
+            "Listening SOCKS5 on {} — xray / Telegram / app-level SOCKS5 clients use this.",
+            socks_addr
         );
 
-        // Periodic stats log (every 60s at info level).
         let stats_fronter = self.fronter.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await; // drop the immediate first tick
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 let s = stats_fronter.snapshot_stats();
@@ -133,34 +142,65 @@ impl ProxyServer {
             }
         });
 
-        loop {
-            let (sock, peer) = match listener.accept().await {
-                Ok(x) => x,
-                Err(e) => {
-                    tracing::error!("accept error: {}", e);
-                    continue;
-                }
-            };
-            let _ = sock.set_nodelay(true);
-            let fronter = self.fronter.clone();
-            let mitm = self.mitm.clone();
-            let rewrite_ctx = self.rewrite_ctx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_client(sock, fronter, mitm, rewrite_ctx).await {
-                    tracing::debug!("client {} closed: {}", peer, e);
-                }
-            });
-        }
+        let http_fronter = self.fronter.clone();
+        let http_mitm = self.mitm.clone();
+        let http_ctx = self.rewrite_ctx.clone();
+        let http_task = tokio::spawn(async move {
+            loop {
+                let (sock, peer) = match http_listener.accept().await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::error!("accept (http): {}", e);
+                        continue;
+                    }
+                };
+                let _ = sock.set_nodelay(true);
+                let fronter = http_fronter.clone();
+                let mitm = http_mitm.clone();
+                let rewrite_ctx = http_ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx).await {
+                        tracing::debug!("http client {} closed: {}", peer, e);
+                    }
+                });
+            }
+        });
+
+        let socks_fronter = self.fronter.clone();
+        let socks_mitm = self.mitm.clone();
+        let socks_ctx = self.rewrite_ctx.clone();
+        let socks_task = tokio::spawn(async move {
+            loop {
+                let (sock, peer) = match socks_listener.accept().await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::error!("accept (socks): {}", e);
+                        continue;
+                    }
+                };
+                let _ = sock.set_nodelay(true);
+                let fronter = socks_fronter.clone();
+                let mitm = socks_mitm.clone();
+                let rewrite_ctx = socks_ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx).await {
+                        tracing::debug!("socks client {} closed: {}", peer, e);
+                    }
+                });
+            }
+        });
+
+        let _ = tokio::join!(http_task, socks_task);
+        Ok(())
     }
 }
 
-async fn handle_client(
+async fn handle_http_client(
     mut sock: TcpStream,
     fronter: Arc<DomainFronter>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
-    // Read the first request (head only).
     let (head, leftover) = match read_http_head(&mut sock).await? {
         Some(v) => v,
         None => return Ok(()),
@@ -171,14 +211,193 @@ async fn handle_client(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
-        if matches_sni_rewrite(&host) || hosts_override(&rewrite_ctx.hosts, &host).is_some() {
-            do_sni_rewrite_connect(sock, &host, port, mitm, rewrite_ctx).await
-        } else {
-            do_connect(sock, &target, fronter, mitm).await
-        }
+        sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        sock.flush().await?;
+        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
     } else {
         do_plain_http(sock, &head, &leftover, fronter).await
     }
+}
+
+// ---------- SOCKS5 ----------
+
+async fn handle_socks5_client(
+    mut sock: TcpStream,
+    fronter: Arc<DomainFronter>,
+    mitm: Arc<Mutex<MitmCertManager>>,
+    rewrite_ctx: Arc<RewriteCtx>,
+) -> std::io::Result<()> {
+    // RFC 1928 handshake: VER=5, NMETHODS, METHODS...
+    let mut hdr = [0u8; 2];
+    sock.read_exact(&mut hdr).await?;
+    if hdr[0] != 0x05 {
+        return Ok(());
+    }
+    let nmethods = hdr[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    sock.read_exact(&mut methods).await?;
+    // Only "no auth" (0x00) is supported.
+    if !methods.contains(&0x00) {
+        sock.write_all(&[0x05, 0xff]).await?;
+        return Ok(());
+    }
+    sock.write_all(&[0x05, 0x00]).await?;
+
+    // Request: VER=5, CMD, RSV=0, ATYP, DST.ADDR, DST.PORT
+    let mut req = [0u8; 4];
+    sock.read_exact(&mut req).await?;
+    if req[0] != 0x05 {
+        return Ok(());
+    }
+    let cmd = req[1];
+    if cmd != 0x01 {
+        // CONNECT only.
+        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        return Ok(());
+    }
+    let atyp = req[3];
+    let host: String = match atyp {
+        0x01 => {
+            let mut ip = [0u8; 4];
+            sock.read_exact(&mut ip).await?;
+            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            sock.read_exact(&mut len).await?;
+            let mut name = vec![0u8; len[0] as usize];
+            sock.read_exact(&mut name).await?;
+            String::from_utf8_lossy(&name).into_owned()
+        }
+        0x04 => {
+            let mut ip = [0u8; 16];
+            sock.read_exact(&mut ip).await?;
+            let addr = std::net::Ipv6Addr::from(ip);
+            addr.to_string()
+        }
+        _ => {
+            sock.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            return Ok(());
+        }
+    };
+    let mut port_buf = [0u8; 2];
+    sock.read_exact(&mut port_buf).await?;
+    let port = u16::from_be_bytes(port_buf);
+
+    tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
+
+    // Success reply with zeroed BND.
+    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    sock.flush().await?;
+
+    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
+}
+
+// ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
+
+async fn dispatch_tunnel(
+    sock: TcpStream,
+    host: String,
+    port: u16,
+    fronter: Arc<DomainFronter>,
+    mitm: Arc<Mutex<MitmCertManager>>,
+    rewrite_ctx: Arc<RewriteCtx>,
+) -> std::io::Result<()> {
+    // 1. Explicit hosts override or SNI-rewrite suffix: always use the tunnel.
+    if matches_sni_rewrite(&host) || hosts_override(&rewrite_ctx.hosts, &host).is_some() {
+        return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
+    }
+
+    // 2. Peek at the first byte to detect TLS vs plain. Time-bounded — if the
+    //    client doesn't send anything within 300ms, assume server-first
+    //    protocol (SMTP, POP3, FTP banner) and jump straight to plain TCP.
+    let mut peek_buf = [0u8; 8];
+    let peek_n = match tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        sock.peek(&mut peek_buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(_)) => return Ok(()),
+        Err(_) => {
+            // Client silent: likely a server-first protocol.
+            plain_tcp_passthrough(sock, &host, port).await;
+            return Ok(());
+        }
+    };
+
+    if peek_n >= 1 && peek_buf[0] == 0x16 {
+        // Looks like TLS: MITM + relay via Apps Script.
+        run_mitm_then_relay(sock, &host, port, mitm, &fronter).await;
+        return Ok(());
+    }
+
+    // 3. Not TLS. If bytes look like HTTP, relay on scheme=http. Otherwise
+    //    fall back to plain TCP passthrough.
+    if peek_n > 0 && looks_like_http(&peek_buf[..peek_n]) {
+        let scheme = if port == 443 { "https" } else { "http" };
+        relay_http_stream_raw(sock, &host, port, scheme, &fronter).await;
+        return Ok(());
+    }
+
+    plain_tcp_passthrough(sock, &host, port).await;
+    Ok(())
+}
+
+// ---------- Plain TCP passthrough ----------
+
+async fn plain_tcp_passthrough(mut sock: TcpStream, host: &str, port: u16) {
+    let target_host = host.trim_start_matches('[').trim_end_matches(']');
+    let upstream = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect((target_host, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::debug!("plain-tcp connect {}:{} failed: {}", host, port, e);
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("plain-tcp connect {}:{} timeout", host, port);
+            return;
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+    tracing::info!("plain-tcp passthrough -> {}:{}", host, port);
+    let (mut ar, mut aw) = sock.split();
+    let (mut br, mut bw) = {
+        let (r, w) = upstream.into_split();
+        (r, w)
+    };
+    let t1 = tokio::io::copy(&mut ar, &mut bw);
+    let t2 = tokio::io::copy(&mut br, &mut aw);
+    tokio::select! {
+        _ = t1 => {}
+        _ = t2 => {}
+    }
+}
+
+fn looks_like_http(first_bytes: &[u8]) -> bool {
+    // Cheap sniff: must start with an ASCII HTTP method token followed by a space.
+    for m in [
+        "GET ",
+        "POST ",
+        "PUT ",
+        "HEAD ",
+        "DELETE ",
+        "PATCH ",
+        "OPTIONS ",
+        "CONNECT ",
+        "TRACE ",
+    ] {
+        if first_bytes.starts_with(m.as_bytes()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read an HTTP head (request line + headers) up to the first \r\n\r\n.
@@ -260,26 +479,22 @@ fn is_valid_http_method(m: &str) -> bool {
 
 // ---------- CONNECT handling ----------
 
-async fn do_connect(
-    mut sock: TcpStream,
-    target: &str,
-    fronter: Arc<DomainFronter>,
+async fn run_mitm_then_relay(
+    sock: TcpStream,
+    host: &str,
+    port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
-) -> std::io::Result<()> {
-    let (host, port) = parse_host_port(target);
-    tracing::info!("CONNECT -> {}:{}", host, port);
+    fronter: &DomainFronter,
+) {
+    tracing::info!("MITM TLS -> {}:{}", host, port);
 
-    sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-    sock.flush().await?;
-
-    // MITM: build a server config for this domain and accept TLS.
     let server_config = {
         let mut m = mitm.lock().await;
-        match m.get_server_config(&host) {
+        match m.get_server_config(host) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("cert gen failed for {}: {}", host, e);
-                return Ok(());
+                return;
             }
         }
     };
@@ -289,13 +504,14 @@ async fn do_connect(
         Ok(t) => t,
         Err(e) => {
             tracing::debug!("TLS accept failed for {}: {}", host, e);
-            return Ok(());
+            return;
         }
     };
 
     // Keep-alive loop: read HTTP requests from the decrypted stream.
+    // scheme=https because we MITM-terminated TLS.
     loop {
-        match handle_mitm_request(&mut tls, &host, port, &fronter).await {
+        match handle_mitm_request(&mut tls, host, port, fronter, "https").await {
             Ok(true) => continue,
             Ok(false) => break,
             Err(e) => {
@@ -304,19 +520,36 @@ async fn do_connect(
             }
         }
     }
-    Ok(())
 }
 
-async fn do_sni_rewrite_connect(
+// ---------- Plain HTTP relay on a raw TCP stream (port 80 targets) ----------
+
+async fn relay_http_stream_raw(
     mut sock: TcpStream,
+    host: &str,
+    port: u16,
+    scheme: &str,
+    fronter: &DomainFronter,
+) {
+    loop {
+        match handle_mitm_request(&mut sock, host, port, fronter, scheme).await {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(e) => {
+                tracing::debug!("http relay error for {}: {}", host, e);
+                break;
+            }
+        }
+    }
+}
+
+async fn do_sni_rewrite_tunnel_from_tcp(
+    sock: TcpStream,
     host: &str,
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
-    sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-    sock.flush().await?;
-
     let target_ip = hosts_override(&rewrite_ctx.hosts, host)
         .map(|s| s.to_string())
         .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
@@ -457,6 +690,7 @@ async fn handle_mitm_request<S>(
     host: &str,
     port: u16,
     fronter: &DomainFronter,
+    scheme: &str,
 ) -> std::io::Result<bool>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -474,13 +708,14 @@ where
     // Read body if content-length is set.
     let body = read_body(stream, &leftover, &headers).await?;
 
-    let url = if port == 443 {
-        format!("https://{}{}", host, path)
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let url = if port == default_port {
+        format!("{}://{}{}", scheme, host, path)
     } else {
-        format!("https://{}:{}{}", host, port, path)
+        format!("{}://{}:{}{}", scheme, host, port, path)
     };
 
-    tracing::info!("MITM {} {}", method, url);
+    tracing::info!("relay {} {}", method, url);
 
     let response = fronter.relay(&method, &url, &headers, &body).await;
     stream.write_all(&response).await?;

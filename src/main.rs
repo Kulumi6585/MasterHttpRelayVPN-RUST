@@ -176,7 +176,10 @@ async fn main() -> ExitCode {
         Command::Serve => {}
     }
 
+    let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
     tracing::warn!("mhrv-rs {} starting (mode: apps_script)", VERSION);
+    tracing::info!("HTTP proxy   : {}:{}", config.listen_host, config.listen_port);
+    tracing::info!("SOCKS5 proxy : {}:{}", config.listen_host, socks5_port);
     tracing::info!(
         "Apps Script relay: SNI={} -> script.google.com (via {})",
         config.front_domain,

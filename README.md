@@ -98,13 +98,20 @@ mhrv-rs.exe --config config.json    # Windows
 - **`mhrv-rs test`** — send one request through the relay and report success/timing. Useful when setting up or debugging. Does not need the proxy to be running.
 - **`mhrv-rs scan-ips`** — parallel TLS probe of known Google frontend IPs, sorted by latency. Swap the winning IP into your `google_ip` config field for best performance.
 
-### Step 6: Point your browser at the proxy
+### Step 6: Point your client at the proxy
 
-Configure your browser to use HTTP proxy `127.0.0.1:8085`.
+The tool listens on **two** ports:
+- **HTTP proxy** on `listen_port` (default `8085`) — for browsers / any HTTP-aware client
+- **SOCKS5 proxy** on `socks5_port` (default `listen_port + 1`, i.e. `8086`) — for xray / Telegram / app-level clients
 
-- **Firefox**: Settings → Network Settings → Manual proxy → enter for HTTP, check "Also use this proxy for HTTPS"
-- **Chrome/Edge**: System proxy settings, or use SwitchyOmega extension
+**Browser (HTTP proxy):**
+- **Firefox**: Settings → Network Settings → Manual proxy → HTTP `127.0.0.1:8085`, check "Also use this proxy for HTTPS"
+- **Chrome/Edge**: System proxy settings, or SwitchyOmega
 - **macOS system-wide**: System Settings → Network → Wi-Fi → Details → Proxies → Web + Secure Web Proxy
+
+**xray / Telegram (SOCKS5):**
+- Point the SOCKS5 setting at `127.0.0.1:8086`, no auth.
+- Non-HTTP protocols (MTProto, raw TCP) fall back to plain-TCP passthrough automatically.
 
 ## What's implemented vs not
 
