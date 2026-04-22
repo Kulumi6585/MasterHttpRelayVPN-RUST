@@ -95,10 +95,16 @@ enum Cmd {
     PollStats,
     /// Probe a single SNI against the given google_ip. Result is written
     /// into UiState::sni_probe keyed by the SNI string.
-    TestSni { google_ip: String, sni: String },
+    TestSni {
+        google_ip: String,
+        sni: String,
+    },
     /// Probe a batch of SNI names. Results appear in UiState::sni_probe one
     /// by one as each probe finishes.
-    TestAllSni { google_ip: String, snis: Vec<String> },
+    TestAllSni {
+        google_ip: String,
+        snis: Vec<String>,
+    },
 }
 
 struct App {
@@ -213,7 +219,10 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
     if !user_clean.is_empty() {
         return user_clean
             .into_iter()
-            .map(|name| SniRow { name, enabled: true })
+            .map(|name| SniRow {
+                name,
+                enabled: true,
+            })
             .collect();
     }
     // Default: primary + the other Google-edge subdomains, primary first,
@@ -223,11 +232,17 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
     let mut out = Vec::new();
     if !primary.is_empty() {
         seen.insert(primary.clone());
-        out.push(SniRow { name: primary, enabled: true });
+        out.push(SniRow {
+            name: primary,
+            enabled: true,
+        });
     }
     for s in DEFAULT_GOOGLE_SNI_POOL {
         if seen.insert(s.to_string()) {
-            out.push(SniRow { name: (*s).to_string(), enabled: true });
+            out.push(SniRow {
+                name: (*s).to_string(),
+                enabled: true,
+            });
         }
     }
     out
@@ -281,7 +296,11 @@ impl FormState {
             enable_batching: false,
             upstream_socks5: {
                 let v = self.upstream_socks5.trim();
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             },
             parallel_relay: self.parallel_relay,
             sni_hosts: {
@@ -296,7 +315,11 @@ impl FormState {
                 // If the user's pool is empty/all-off we still save as None so
                 // the backend falls back to sensible defaults instead of dying
                 // on an empty pool.
-                if active.is_empty() { None } else { Some(active) }
+                if active.is_empty() {
+                    None
+                } else {
+                    Some(active)
+                }
             },
         })
     }
@@ -307,8 +330,7 @@ fn save_config(cfg: &Config) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(&ConfigWire::from(cfg))
-        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&ConfigWire::from(cfg)).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
     Ok(path)
 }
@@ -368,7 +390,10 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             hosts: &c.hosts,
             upstream_socks5: c.upstream_socks5.as_deref(),
             parallel_relay: c.parallel_relay,
-            sni_hosts: c.sni_hosts.as_ref().map(|v| v.iter().map(String::as_str).collect()),
+            sni_hosts: c
+                .sni_hosts
+                .as_ref()
+                .map(|v| v.iter().map(String::as_str).collect()),
         }
     }
 }
@@ -766,14 +791,13 @@ impl App {
                             });
                         }
                     }
-                    if ui.button("Keep working only").on_hover_text(
-                        "Uncheck every SNI that didn't pass the last probe."
-                    ).clicked() {
+                    if ui
+                        .button("Keep working only")
+                        .on_hover_text("Uncheck every SNI that didn't pass the last probe.")
+                        .clicked()
+                    {
                         for row in &mut self.form.sni_pool {
-                            let ok = matches!(
-                                probe_map.get(&row.name),
-                                Some(SniProbeState::Ok(_))
-                            );
+                            let ok = matches!(probe_map.get(&row.name), Some(SniProbeState::Ok(_)));
                             row.enabled = ok;
                         }
                     }
@@ -785,13 +809,20 @@ impl App {
                     if ui.button("Clear status").clicked() {
                         self.shared.state.lock().unwrap().sni_probe.clear();
                     }
-                    if ui.button("Reset to defaults").on_hover_text(
-                        "Replace the list with the built-in Google SNI pool. Custom entries \
-                         are dropped."
-                    ).clicked() {
+                    if ui
+                        .button("Reset to defaults")
+                        .on_hover_text(
+                            "Replace the list with the built-in Google SNI pool. Custom entries \
+                         are dropped.",
+                        )
+                        .clicked()
+                    {
                         self.form.sni_pool = DEFAULT_GOOGLE_SNI_POOL
                             .iter()
-                            .map(|s| SniRow { name: (*s).to_string(), enabled: true })
+                            .map(|s| SniRow {
+                                name: (*s).to_string(),
+                                enabled: true,
+                            })
                             .collect();
                         self.shared.state.lock().unwrap().sni_probe.clear();
                     }
@@ -804,51 +835,55 @@ impl App {
                 let mut test_name: Option<String> = None;
                 const STATUS_W: f32 = 150.0;
                 const NAME_W: f32 = 230.0;
-                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                    for (i, row) in self.form.sni_pool.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut row.enabled, "");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut row.name)
-                                    .desired_width(NAME_W)
-                                    .font(egui::TextStyle::Monospace),
-                            );
-                            let status_txt = match probe_map.get(&row.name) {
-                                Some(SniProbeState::Ok(ms)) => {
-                                    egui::RichText::new(format!("ok  {} ms", ms))
-                                        .color(egui::Color32::from_rgb(80, 180, 100))
-                                        .monospace()
-                                }
-                                Some(SniProbeState::Failed(e)) => {
-                                    let short = if e.len() > 22 { &e[..22] } else { e };
-                                    egui::RichText::new(format!("fail {}", short))
-                                        .color(egui::Color32::from_rgb(220, 110, 110))
-                                        .monospace()
-                                }
-                                Some(SniProbeState::InFlight) => {
-                                    egui::RichText::new("testing…")
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for (i, row) in self.form.sni_pool.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut row.enabled, "");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut row.name)
+                                        .desired_width(NAME_W)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                let status_txt = match probe_map.get(&row.name) {
+                                    Some(SniProbeState::Ok(ms)) => {
+                                        egui::RichText::new(format!("ok  {} ms", ms))
+                                            .color(egui::Color32::from_rgb(80, 180, 100))
+                                            .monospace()
+                                    }
+                                    Some(SniProbeState::Failed(e)) => {
+                                        let short = if e.len() > 22 { &e[..22] } else { e };
+                                        egui::RichText::new(format!("fail {}", short))
+                                            .color(egui::Color32::from_rgb(220, 110, 110))
+                                            .monospace()
+                                    }
+                                    Some(SniProbeState::InFlight) => {
+                                        egui::RichText::new("testing…")
+                                            .color(egui::Color32::GRAY)
+                                            .monospace()
+                                    }
+                                    None => egui::RichText::new("untested")
                                         .color(egui::Color32::GRAY)
-                                        .monospace()
+                                        .monospace(),
+                                };
+                                ui.add_sized(
+                                    [STATUS_W, 18.0],
+                                    egui::Label::new(status_txt).truncate(),
+                                );
+                                if ui.small_button("Test").clicked() {
+                                    test_name = Some(row.name.clone());
                                 }
-                                None => {
-                                    egui::RichText::new("untested")
-                                        .color(egui::Color32::GRAY)
-                                        .monospace()
+                                if ui
+                                    .small_button("remove")
+                                    .on_hover_text("Remove this row")
+                                    .clicked()
+                                {
+                                    to_remove = Some(i);
                                 }
-                            };
-                            ui.add_sized([STATUS_W, 18.0], egui::Label::new(status_txt).truncate());
-                            if ui.small_button("Test").clicked() {
-                                test_name = Some(row.name.clone());
-                            }
-                            if ui.small_button("remove")
-                                .on_hover_text("Remove this row")
-                                .clicked()
-                            {
-                                to_remove = Some(i);
-                            }
-                        });
-                    }
-                });
+                            });
+                        }
+                    });
 
                 if let Some(name) = test_name {
                     let name = name.trim().to_string();
@@ -930,12 +965,16 @@ fn fmt_bytes(b: u64) -> String {
 fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
     let rt = Runtime::new().expect("failed to create tokio runtime");
 
-    let mut active: Option<(JoinHandle<()>, Arc<AsyncMutex<Option<Arc<DomainFronter>>>>)> = None;
+    let mut active: Option<(
+        JoinHandle<()>,
+        Arc<AsyncMutex<Option<Arc<DomainFronter>>>>,
+        tokio::sync::oneshot::Sender<()>,
+    )> = None;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Cmd::PollStats) => {
-                if let Some((_, fronter_slot)) = &active {
+                if let Some((_, fronter_slot, _)) = &active {
                     let slot = fronter_slot.clone();
                     let shared = shared.clone();
                     rt.spawn(async move {
@@ -950,6 +989,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     });
                 }
             }
+            // In background_thread function, modify the Cmd::Start handler:
             Ok(Cmd::Start(cfg)) => {
                 if active.is_some() {
                     push_log(&shared, "[ui] already running");
@@ -960,6 +1000,8 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 let fronter_slot: Arc<AsyncMutex<Option<Arc<DomainFronter>>>> =
                     Arc::new(AsyncMutex::new(None));
                 let fronter_slot2 = fronter_slot.clone();
+
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
                 let handle = rt.spawn(async move {
                     let base = data_dir::data_dir();
@@ -986,27 +1028,49 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         s.running = true;
                         s.started_at = Some(Instant::now());
                     }
-                    push_log(&shared2, &format!(
-                        "[ui] listening HTTP {}:{} SOCKS5 {}:{}",
-                        cfg.listen_host, cfg.listen_port,
-                        cfg.listen_host, cfg.socks5_port.unwrap_or(cfg.listen_port + 1)
-                    ));
-                    let _ = server.run().await;
+                    push_log(
+                        &shared2,
+                        &format!(
+                            "[ui] listening HTTP {}:{} SOCKS5 {}:{}",
+                            cfg.listen_host,
+                            cfg.listen_port,
+                            cfg.listen_host,
+                            cfg.socks5_port.unwrap_or(cfg.listen_port + 1)
+                        ),
+                    );
+
+                    let _ = server.run(shutdown_rx).await;
+
                     shared2.state.lock().unwrap().running = false;
                     push_log(&shared2, "[ui] proxy stopped");
                 });
 
-                active = Some((handle, fronter_slot));
+                active = Some((handle, fronter_slot, shutdown_tx));
             }
+
             Ok(Cmd::Stop) => {
-                if let Some((handle, _)) = active.take() {
-                    handle.abort();
+                if let Some((handle, _, shutdown_tx)) = active.take() {
+                    push_log(&shared, "[ui] stop requested");
+                    let _ = shutdown_tx.send(());
+
+                    // Give the proxy 2 seconds to shut down gracefully
+                    rt.block_on(async {
+                        tokio::select! {
+                            _ = handle => {
+                                push_log(&shared, "[ui] proxy stopped gracefully");
+                            }
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                                push_log(&shared, "[ui] shutdown timeout, forcing abort");
+                            }
+                        }
+                    });
+
                     shared.state.lock().unwrap().running = false;
                     shared.state.lock().unwrap().started_at = None;
                     shared.state.lock().unwrap().last_stats = None;
-                    push_log(&shared, "[ui] stop requested");
                 }
             }
+
             Ok(Cmd::Test(cfg)) => {
                 let shared2 = shared.clone();
                 push_log(&shared, "[ui] running test...");
@@ -1018,7 +1082,10 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     } else {
                         "Test failed — see terminal for details.".into()
                     };
-                    push_log(&shared2, &format!("[ui] test result: {}", if ok { "pass" } else { "fail" }));
+                    push_log(
+                        &shared2,
+                        &format!("[ui] test result: {}", if ok { "pass" } else { "fail" }),
+                    );
                     // Also run ip scan on demand (cheap).
                     let _ = scan_ips::run(&cfg).await;
                 });
@@ -1055,7 +1122,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     let result = scan_sni::probe_one(&google_ip, &sni).await;
                     let state = match result.latency_ms {
                         Some(ms) => SniProbeState::Ok(ms),
-                        None => SniProbeState::Failed(result.error.unwrap_or_else(|| "failed".into())),
+                        None => {
+                            SniProbeState::Failed(result.error.unwrap_or_else(|| "failed".into()))
+                        }
                     };
                     shared2.state.lock().unwrap().sni_probe.insert(sni, state);
                 });
@@ -1074,7 +1143,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     for (sni, r) in results {
                         let state = match r.latency_ms {
                             Some(ms) => SniProbeState::Ok(ms),
-                            None => SniProbeState::Failed(r.error.unwrap_or_else(|| "failed".into())),
+                            None => {
+                                SniProbeState::Failed(r.error.unwrap_or_else(|| "failed".into()))
+                            }
                         };
                         st.sni_probe.insert(sni, state);
                     }
@@ -1093,7 +1164,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         }
 
         // Clean up finished task.
-        if let Some((handle, _)) = &active {
+        if let Some((handle, _, _)) = &active {
             if handle.is_finished() {
                 active = None;
                 shared.state.lock().unwrap().running = false;
@@ -1105,7 +1176,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 fn push_log(shared: &Shared, msg: &str) {
     let line = format!(
         "{}  {}",
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Iso8601::DEFAULT).unwrap_or_default(),
+        time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Iso8601::DEFAULT)
+            .unwrap_or_default(),
         msg
     );
     let mut s = shared.state.lock().unwrap();

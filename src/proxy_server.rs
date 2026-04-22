@@ -54,7 +54,10 @@ fn matches_sni_rewrite(host: &str) -> bool {
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
-fn hosts_override<'a>(hosts: &'a std::collections::HashMap<String, String>, host: &str) -> Option<&'a str> {
+fn hosts_override<'a>(
+    hosts: &'a std::collections::HashMap<String, String>,
+    host: &str,
+) -> Option<&'a str> {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
     if let Some(ip) = hosts.get(h) {
@@ -135,8 +138,10 @@ impl ProxyServer {
     pub fn fronter(&self) -> Arc<DomainFronter> {
         self.fronter.clone()
     }
-
-    pub async fn run(self) -> Result<(), ProxyError> {
+    pub async fn run(
+        self,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), ProxyError> {
         let http_addr = format!("{}:{}", self.host, self.port);
         let socks_addr = format!("{}:{}", self.host, self.socks5_port);
         let http_listener = TcpListener::bind(&http_addr).await?;
@@ -149,7 +154,6 @@ impl ProxyServer {
             "Listening SOCKS5 on {} — xray / Telegram / app-level SOCKS5 clients use this.",
             socks_addr
         );
-
         // Pre-warm the outbound connection pool so the user's first request
         // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
         // failures are logged and ignored.
@@ -159,7 +163,7 @@ impl ProxyServer {
         });
 
         let stats_fronter = self.fronter.clone();
-        tokio::spawn(async move {
+        let stats_task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
@@ -175,7 +179,7 @@ impl ProxyServer {
         let http_fronter = self.fronter.clone();
         let http_mitm = self.mitm.clone();
         let http_ctx = self.rewrite_ctx.clone();
-        let http_task = tokio::spawn(async move {
+        let mut http_task = tokio::spawn(async move {
             loop {
                 let (sock, peer) = match http_listener.accept().await {
                     Ok(x) => x,
@@ -199,7 +203,7 @@ impl ProxyServer {
         let socks_fronter = self.fronter.clone();
         let socks_mitm = self.mitm.clone();
         let socks_ctx = self.rewrite_ctx.clone();
-        let socks_task = tokio::spawn(async move {
+        let mut socks_task = tokio::spawn(async move {
             loop {
                 let (sock, peer) = match socks_listener.accept().await {
                     Ok(x) => x,
@@ -220,7 +224,18 @@ impl ProxyServer {
             }
         });
 
-        let _ = tokio::join!(http_task, socks_task);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown_rx => {
+                tracing::info!("Shutdown signal received, stopping listeners");
+                stats_task.abort();
+                http_task.abort();
+                socks_task.abort();
+            }
+            _ = &mut http_task => {}
+            _ = &mut socks_task => {}
+        }
+
         Ok(())
     }
 }
@@ -241,7 +256,8 @@ async fn handle_http_client(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
-        sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
         sock.flush().await?;
         dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
     } else {
@@ -282,7 +298,8 @@ async fn handle_socks5_client(
     let cmd = req[1];
     if cmd != 0x01 {
         // CONNECT only.
-        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         return Ok(());
     }
     let atyp = req[3];
@@ -306,7 +323,8 @@ async fn handle_socks5_client(
             addr.to_string()
         }
         _ => {
-            sock.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            sock.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
             return Ok(());
         }
     };
@@ -317,7 +335,8 @@ async fn handle_socks5_client(
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
 
     // Success reply with zeroed BND.
-    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
     sock.flush().await?;
 
     dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
@@ -393,7 +412,10 @@ async fn plain_tcp_passthrough(
             Err(e) => {
                 tracing::warn!(
                     "upstream-socks5 {} -> {}:{} failed: {} (falling back to direct)",
-                    proxy, host, port, e
+                    proxy,
+                    host,
+                    port,
+                    e
                 );
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
@@ -443,19 +465,12 @@ async fn plain_tcp_passthrough(
 
 /// Open a TCP stream to `(host, port)` through an upstream SOCKS5 proxy
 /// (no-auth only). Returns the connected stream after SOCKS5 negotiation.
-async fn socks5_connect_via(
-    proxy: &str,
-    host: &str,
-    port: u16,
-) -> std::io::Result<TcpStream> {
+async fn socks5_connect_via(proxy: &str, host: &str, port: u16) -> std::io::Result<TcpStream> {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
-    let mut s = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TcpStream::connect(proxy),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+    let mut s = tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(proxy))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
     let _ = s.set_nodelay(true);
 
     // Greeting: VER=5, NMETHODS=1, METHOD=no-auth
@@ -531,15 +546,7 @@ async fn socks5_connect_via(
 fn looks_like_http(first_bytes: &[u8]) -> bool {
     // Cheap sniff: must start with an ASCII HTTP method token followed by a space.
     for m in [
-        "GET ",
-        "POST ",
-        "PUT ",
-        "HEAD ",
-        "DELETE ",
-        "PATCH ",
-        "OPTIONS ",
-        "CONNECT ",
-        "TRACE ",
+        "GET ", "POST ", "PUT ", "HEAD ", "DELETE ", "PATCH ", "OPTIONS ", "CONNECT ", "TRACE ",
     ] {
         if first_bytes.starts_with(m.as_bytes()) {
             return true;
@@ -613,15 +620,7 @@ fn parse_request_head(head: &[u8]) -> Option<(String, String, String, Vec<(Strin
 fn is_valid_http_method(m: &str) -> bool {
     matches!(
         m,
-        "GET"
-            | "POST"
-            | "PUT"
-            | "DELETE"
-            | "HEAD"
-            | "OPTIONS"
-            | "PATCH"
-            | "TRACE"
-            | "CONNECT"
+        "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" | "TRACE" | "CONNECT"
     )
 }
 
@@ -704,7 +703,10 @@ async fn do_sni_rewrite_tunnel_from_tcp(
 
     tracing::info!(
         "SNI-rewrite tunnel -> {}:{} via {} (outbound SNI={})",
-        host, port, target_ip, rewrite_ctx.front_domain
+        host,
+        port,
+        target_ip,
+        rewrite_ctx.front_domain
     );
 
     // Accept browser TLS with a cert we sign for `host`.

@@ -90,7 +90,9 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-c" | "--config" => {
-                let v = it.next().ok_or_else(|| "--config needs a path".to_string())?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--config needs a path".to_string())?;
                 config_path = Some(PathBuf::from(v));
             }
             "--install-cert" => install_cert = true,
@@ -107,8 +109,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn init_logging(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -168,22 +169,38 @@ async fn main() -> ExitCode {
     match args.command {
         Command::Test => {
             let ok = test_cmd::run(&config).await;
-            return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            return if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
         }
         Command::ScanIps => {
             let ok = scan_ips::run(&config).await;
-            return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            return if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
         }
         Command::TestSni => {
             let ok = mhrv_rs::scan_sni::run(&config).await;
-            return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+            return if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
         }
         Command::Serve => {}
     }
 
     let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
     tracing::warn!("mhrv-rs {} starting (mode: apps_script)", VERSION);
-    tracing::info!("HTTP proxy   : {}:{}", config.listen_host, config.listen_port);
+    tracing::info!(
+        "HTTP proxy   : {}:{}",
+        config.listen_host,
+        config.listen_port
+    );
     tracing::info!("SOCKS5 proxy : {}:{}", config.listen_host, socks5_port);
     tracing::info!(
         "Apps Script relay: SNI={} -> script.google.com (via {})",
@@ -233,7 +250,9 @@ async fn main() -> ExitCode {
         }
     };
 
-    let run = server.run();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    let run = server.run(shutdown_rx);
     tokio::select! {
         r = run => {
             if let Err(e) = r {
@@ -243,6 +262,7 @@ async fn main() -> ExitCode {
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::warn!("Ctrl+C — shutting down.");
+            let _ = shutdown_tx.send(());
         }
     }
     ExitCode::SUCCESS
