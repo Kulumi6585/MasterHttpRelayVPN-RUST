@@ -164,7 +164,10 @@ impl DomainFronter {
 
         Ok(Self {
             connect_host: config.google_ip.clone(),
-            sni_hosts: build_sni_pool(&config.front_domain),
+            sni_hosts: build_sni_pool_for(
+                &config.front_domain,
+                config.sni_hosts.as_deref().unwrap_or(&[]),
+            ),
             sni_idx: AtomicUsize::new(0),
             http_host: "script.google.com",
             auth_key: config.auth_key.clone(),
@@ -714,36 +717,57 @@ fn extract_host(url: &str) -> Option<String> {
     }
 }
 
+/// The default pool of SNI names that share the Google Front End with
+/// `www.google.com`. Used both when auto-expanding from `front_domain` and
+/// when the UI wants to show the starting candidates for the SNI editor.
+pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
+    "www.google.com",
+    "mail.google.com",
+    "drive.google.com",
+    "docs.google.com",
+    "calendar.google.com",
+];
+
 /// Build the pool of SNI hosts used for outbound connections to the Google
-/// edge. Takes the user-configured `front_domain` as the primary and adds a
-/// few other Google-owned subdomains that share the same GFE, so the per-SNI
-/// connection-count fingerprint gets spread instead of concentrating on one
-/// name. All entries MUST be hosted on the same edge as `connect_host`,
-/// otherwise the TLS handshake will land on the wrong server.
+/// edge.
 ///
-/// If the user has set `front_domain` to something off the default list, we
-/// still include it first and don't add extras (we'd have no way to verify
-/// they're co-hosted with a non-Google custom edge).
-fn build_sni_pool(primary: &str) -> Vec<String> {
+/// Precedence:
+/// 1. If `user_pool` is non-empty, use it verbatim (user is in charge).
+/// 2. If `primary` is one of the DEFAULT_GOOGLE_SNI_POOL entries, auto-expand
+///    to the full default list with `primary` first. This gives the per-SNI
+///    connection-count fingerprint spread without the user configuring
+///    anything.
+/// 3. Otherwise — custom / non-Google `primary` — use just `[primary]`, since
+///    we have no way to verify which sibling names share a non-Google edge.
+///
+/// All entries MUST be hosted on the same edge as `connect_host`, otherwise
+/// the TLS handshake will land on the wrong server.
+pub fn build_sni_pool_for(primary: &str, user_pool: &[String]) -> Vec<String> {
     let primary = primary.trim().to_string();
-    // A Google-edge-hosted primary: augment with siblings.
-    let google_defaults: &[&str] = &[
-        "www.google.com",
-        "mail.google.com",
-        "drive.google.com",
-        "docs.google.com",
-        "calendar.google.com",
-    ];
-    let looks_like_google_edge = google_defaults.iter().any(|s| *s == primary);
+    let user_filtered: Vec<String> = user_pool
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !user_filtered.is_empty() {
+        return user_filtered;
+    }
+
+    let looks_like_google_edge = DEFAULT_GOOGLE_SNI_POOL.iter().any(|s| *s == primary);
     let mut pool = vec![primary.clone()];
     if looks_like_google_edge {
-        for s in google_defaults {
+        for s in DEFAULT_GOOGLE_SNI_POOL {
             if *s != primary {
                 pool.push((*s).to_string());
             }
         }
     }
     pool
+}
+
+/// Back-compat thin wrapper for the old callers / tests.
+fn build_sni_pool(primary: &str) -> Vec<String> {
+    build_sni_pool_for(primary, &[])
 }
 
 pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {

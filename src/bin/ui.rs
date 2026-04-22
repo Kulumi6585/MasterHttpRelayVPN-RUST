@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -12,10 +12,10 @@ use tokio::task::JoinHandle;
 use mhrv_rs::cert_installer::install_ca;
 use mhrv_rs::config::{Config, ScriptId};
 use mhrv_rs::data_dir;
-use mhrv_rs::domain_fronter::DomainFronter;
+use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
-use mhrv_rs::{scan_ips, test_cmd};
+use mhrv_rs::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WIN_WIDTH: f32 = 520.0;
@@ -75,6 +75,15 @@ struct UiState {
     ca_trusted: Option<bool>,
     last_test_ok: Option<bool>,
     last_test_msg: String,
+    /// Per-SNI probe results, populated by Cmd::TestSni / TestAllSni.
+    sni_probe: HashMap<String, SniProbeState>,
+}
+
+#[derive(Clone, Debug)]
+enum SniProbeState {
+    InFlight,
+    Ok(u32),
+    Failed(String),
 }
 
 enum Cmd {
@@ -84,6 +93,12 @@ enum Cmd {
     InstallCa,
     CheckCaTrusted,
     PollStats,
+    /// Probe a single SNI against the given google_ip. Result is written
+    /// into UiState::sni_probe keyed by the SNI string.
+    TestSni { google_ip: String, sni: String },
+    /// Probe a batch of SNI names. Results appear in UiState::sni_probe one
+    /// by one as each probe finishes.
+    TestAllSni { google_ip: String, snis: Vec<String> },
 }
 
 struct App {
@@ -108,6 +123,20 @@ struct FormState {
     upstream_socks5: String,
     parallel_relay: u8,
     show_auth_key: bool,
+    /// SNI rotation pool entries. Each item has a sni name + a checkbox
+    /// flag indicating whether it's in the active rotation.
+    sni_pool: Vec<SniRow>,
+    /// Text field buffer for the "+ add custom SNI" input at the bottom of
+    /// the SNI editor window.
+    sni_custom_input: String,
+    /// Whether the floating SNI editor window is open.
+    sni_editor_open: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SniRow {
+    name: String,
+    enabled: bool,
 }
 
 fn load_form() -> FormState {
@@ -130,6 +159,7 @@ fn load_form() -> FormState {
                 None => String::new(),
             },
         };
+        let sni_pool = sni_pool_for_form(c.sni_hosts.as_deref(), &c.front_domain);
         FormState {
             script_id: sid,
             auth_key: c.auth_key,
@@ -143,6 +173,9 @@ fn load_form() -> FormState {
             upstream_socks5: c.upstream_socks5.unwrap_or_default(),
             parallel_relay: c.parallel_relay,
             show_auth_key: false,
+            sni_pool,
+            sni_custom_input: String::new(),
+            sni_editor_open: false,
         }
     } else {
         FormState {
@@ -158,8 +191,46 @@ fn load_form() -> FormState {
             upstream_socks5: String::new(),
             parallel_relay: 0,
             show_auth_key: false,
+            sni_pool: sni_pool_for_form(None, "www.google.com"),
+            sni_custom_input: String::new(),
+            sni_editor_open: false,
         }
     }
+}
+
+/// Build the initial `sni_pool` list shown in the editor.
+///
+/// If the user has explicit `sni_hosts` configured, we show exactly those
+/// rows (all enabled). Otherwise we show the default Google pool plus any
+/// missing entries, all enabled, with the user's `front_domain` first.
+fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow> {
+    let user_clean: Vec<String> = user
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !user_clean.is_empty() {
+        return user_clean
+            .into_iter()
+            .map(|name| SniRow { name, enabled: true })
+            .collect();
+    }
+    // Default: primary + the other Google-edge subdomains, primary first,
+    // all enabled.
+    let primary = front_domain.trim().to_string();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if !primary.is_empty() {
+        seen.insert(primary.clone());
+        out.push(SniRow { name: primary, enabled: true });
+    }
+    for s in DEFAULT_GOOGLE_SNI_POOL {
+        if seen.insert(s.to_string()) {
+            out.push(SniRow { name: (*s).to_string(), enabled: true });
+        }
+    }
+    out
 }
 
 impl FormState {
@@ -213,6 +284,20 @@ impl FormState {
                 if v.is_empty() { None } else { Some(v.to_string()) }
             },
             parallel_relay: self.parallel_relay,
+            sni_hosts: {
+                let active: Vec<String> = self
+                    .sni_pool
+                    .iter()
+                    .filter(|r| r.enabled)
+                    .map(|r| r.name.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                // None = "use auto-expansion default", Some(list) = explicit.
+                // If the user's pool is empty/all-off we still save as None so
+                // the backend falls back to sensible defaults instead of dying
+                // on an empty pool.
+                if active.is_empty() { None } else { Some(active) }
+            },
         })
     }
 }
@@ -248,6 +333,8 @@ struct ConfigWire<'a> {
     upstream_socks5: Option<&'a str>,
     #[serde(skip_serializing_if = "is_zero_u8")]
     parallel_relay: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sni_hosts: Option<Vec<&'a str>>,
 }
 
 fn is_zero_u8(v: &u8) -> bool {
@@ -281,6 +368,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             hosts: &c.hosts,
             upstream_socks5: c.upstream_socks5.as_deref(),
             parallel_relay: c.parallel_relay,
+            sni_hosts: c.sni_hosts.as_ref().map(|v| v.iter().map(String::as_str).collect()),
         }
     }
 }
@@ -435,8 +523,31 @@ impl eframe::App for App {
                         Err(e) => self.toast = Some((format!("Save failed: {}", e), Instant::now())),
                     }
                 }
+                let active_sni = self.form.sni_pool.iter().filter(|r| r.enabled).count();
+                let total_sni = self.form.sni_pool.len();
+                let sni_btn = egui::Button::new(
+                    egui::RichText::new(format!("SNI pool… ({}/{})", active_sni, total_sni))
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(70, 120, 180))
+                .min_size(egui::vec2(160.0, 0.0));
+                if ui.add(sni_btn)
+                    .on_hover_text(
+                        "Open the SNI rotation pool editor.\n\n\
+                         Edit which SNI names get rotated through for outbound TLS to the\n\
+                         Google edge. Some default names may be locally blocked — use the\n\
+                         Test buttons inside to find out which ones work on your network."
+                    )
+                    .clicked()
+                {
+                    self.form.sni_editor_open = true;
+                }
                 ui.small(format!("location: {}", data_dir::config_path().display()));
             });
+
+            // Floating SNI editor window. Rendered here so it's inside the
+            // same egui context but visually pops out with its own title bar.
+            self.show_sni_editor(ctx);
 
             ui.separator();
 
@@ -604,6 +715,196 @@ impl eframe::App for App {
     }
 }
 
+impl App {
+    /// Floating editor window for the SNI rotation pool. Opens from the
+    /// **SNI pool…** button in the main form. The list is live-editable
+    /// (reorder / toggle / add / remove); changes only persist when the user
+    /// hits **Save config** in the main window. Probe results are cached in
+    /// `UiState::sni_probe` so they survive opening and closing the editor.
+    fn show_sni_editor(&mut self, ctx: &egui::Context) {
+        if !self.form.sni_editor_open {
+            return;
+        }
+        let mut keep_open = true;
+        egui::Window::new("SNI rotation pool")
+            .open(&mut keep_open)
+            .resizable(true)
+            .default_size(egui::vec2(520.0, 420.0))
+            .min_width(460.0)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Which SNI names to rotate through when opening TLS connections \
+                         to your Google IP. Some names may be locally blocked (Iran has \
+                         dropped mail.google.com at times, for example); use the Test \
+                         buttons to check — TLS handshake + HTTP HEAD against the \
+                         configured google_ip, per name.",
+                    )
+                    .small(),
+                );
+                ui.add_space(4.0);
+
+                // Action row.
+                let google_ip = self.form.google_ip.trim().to_string();
+                let probe_map = self.shared.state.lock().unwrap().sni_probe.clone();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Test all").on_hover_text(
+                        "Probe every SNI in the list against the configured google_ip in parallel."
+                    ).clicked() {
+                        let snis: Vec<String> = self
+                            .form
+                            .sni_pool
+                            .iter()
+                            .map(|r| r.name.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !snis.is_empty() && !google_ip.is_empty() {
+                            let _ = self.cmd_tx.send(Cmd::TestAllSni {
+                                google_ip: google_ip.clone(),
+                                snis,
+                            });
+                        }
+                    }
+                    if ui.button("Keep working only").on_hover_text(
+                        "Uncheck every SNI that didn't pass the last probe."
+                    ).clicked() {
+                        for row in &mut self.form.sni_pool {
+                            let ok = matches!(
+                                probe_map.get(&row.name),
+                                Some(SniProbeState::Ok(_))
+                            );
+                            row.enabled = ok;
+                        }
+                    }
+                    if ui.button("Enable all").clicked() {
+                        for row in &mut self.form.sni_pool {
+                            row.enabled = true;
+                        }
+                    }
+                    if ui.button("Clear status").clicked() {
+                        self.shared.state.lock().unwrap().sni_probe.clear();
+                    }
+                    if ui.button("Reset to defaults").on_hover_text(
+                        "Replace the list with the built-in Google SNI pool. Custom entries \
+                         are dropped."
+                    ).clicked() {
+                        self.form.sni_pool = DEFAULT_GOOGLE_SNI_POOL
+                            .iter()
+                            .map(|s| SniRow { name: (*s).to_string(), enabled: true })
+                            .collect();
+                        self.shared.state.lock().unwrap().sni_probe.clear();
+                    }
+                });
+                ui.separator();
+
+                // Main list — one horizontal row per SNI, explicit widths so
+                // the domain text field gets the room it needs.
+                let mut to_remove: Option<usize> = None;
+                let mut test_name: Option<String> = None;
+                const STATUS_W: f32 = 150.0;
+                const NAME_W: f32 = 230.0;
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for (i, row) in self.form.sni_pool.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut row.enabled, "");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut row.name)
+                                    .desired_width(NAME_W)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            let status_txt = match probe_map.get(&row.name) {
+                                Some(SniProbeState::Ok(ms)) => {
+                                    egui::RichText::new(format!("ok  {} ms", ms))
+                                        .color(egui::Color32::from_rgb(80, 180, 100))
+                                        .monospace()
+                                }
+                                Some(SniProbeState::Failed(e)) => {
+                                    let short = if e.len() > 22 { &e[..22] } else { e };
+                                    egui::RichText::new(format!("fail {}", short))
+                                        .color(egui::Color32::from_rgb(220, 110, 110))
+                                        .monospace()
+                                }
+                                Some(SniProbeState::InFlight) => {
+                                    egui::RichText::new("testing…")
+                                        .color(egui::Color32::GRAY)
+                                        .monospace()
+                                }
+                                None => {
+                                    egui::RichText::new("untested")
+                                        .color(egui::Color32::GRAY)
+                                        .monospace()
+                                }
+                            };
+                            ui.add_sized([STATUS_W, 18.0], egui::Label::new(status_txt).truncate());
+                            if ui.small_button("Test").clicked() {
+                                test_name = Some(row.name.clone());
+                            }
+                            if ui.small_button("remove")
+                                .on_hover_text("Remove this row")
+                                .clicked()
+                            {
+                                to_remove = Some(i);
+                            }
+                        });
+                    }
+                });
+
+                if let Some(name) = test_name {
+                    let name = name.trim().to_string();
+                    if !name.is_empty() && !google_ip.is_empty() {
+                        let _ = self.cmd_tx.send(Cmd::TestSni {
+                            google_ip: google_ip.clone(),
+                            sni: name,
+                        });
+                    }
+                }
+                if let Some(i) = to_remove {
+                    self.form.sni_pool.remove(i);
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.sni_custom_input)
+                            .hint_text("add a custom SNI (e.g. translate.google.com)")
+                            .desired_width(280.0),
+                    );
+                    let add_clicked = ui.button("+ Add").clicked();
+                    if add_clicked {
+                        let new_name = self.form.sni_custom_input.trim().to_string();
+                        if !new_name.is_empty()
+                            && !self.form.sni_pool.iter().any(|r| r.name == new_name)
+                        {
+                            self.form.sni_pool.push(SniRow {
+                                name: new_name.clone(),
+                                enabled: true,
+                            });
+                            self.form.sni_custom_input.clear();
+                            // Auto-probe the freshly added name so the user gets
+                            // immediate feedback instead of a silent "untested"
+                            // row. Needs a non-empty google_ip to have meaning.
+                            if !google_ip.is_empty() {
+                                let _ = self.cmd_tx.send(Cmd::TestSni {
+                                    google_ip: google_ip.clone(),
+                                    sni: new_name,
+                                });
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.small(
+                    "Changes take effect on the next Start of the proxy. \
+                     Don't forget to press Save config in the main window to persist.",
+                );
+            });
+        self.form.sni_editor_open = keep_open;
+    }
+}
+
 fn fmt_duration(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -741,6 +1042,41 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             push_log(&shared2, &format!("[ui] CA install failed: {}", e));
                             push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: mhrv-rs --install-cert");
                         }
+                    }
+                });
+            }
+            Ok(Cmd::TestSni { google_ip, sni }) => {
+                let shared2 = shared.clone();
+                {
+                    let mut st = shared2.state.lock().unwrap();
+                    st.sni_probe.insert(sni.clone(), SniProbeState::InFlight);
+                }
+                rt.spawn(async move {
+                    let result = scan_sni::probe_one(&google_ip, &sni).await;
+                    let state = match result.latency_ms {
+                        Some(ms) => SniProbeState::Ok(ms),
+                        None => SniProbeState::Failed(result.error.unwrap_or_else(|| "failed".into())),
+                    };
+                    shared2.state.lock().unwrap().sni_probe.insert(sni, state);
+                });
+            }
+            Ok(Cmd::TestAllSni { google_ip, snis }) => {
+                let shared2 = shared.clone();
+                {
+                    let mut st = shared2.state.lock().unwrap();
+                    for s in &snis {
+                        st.sni_probe.insert(s.clone(), SniProbeState::InFlight);
+                    }
+                }
+                rt.spawn(async move {
+                    let results = scan_sni::probe_all(&google_ip, snis).await;
+                    let mut st = shared2.state.lock().unwrap();
+                    for (sni, r) in results {
+                        let state = match r.latency_ms {
+                            Some(ms) => SniProbeState::Ok(ms),
+                            None => SniProbeState::Failed(r.error.unwrap_or_else(|| "failed".into())),
+                        };
+                        st.sni_probe.insert(sni, state);
                     }
                 });
             }

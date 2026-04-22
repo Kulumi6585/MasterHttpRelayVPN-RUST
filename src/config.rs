@@ -72,6 +72,14 @@ pub struct Config {
     /// script IDs.
     #[serde(default)]
     pub parallel_relay: u8,
+    /// Optional explicit SNI rotation pool for outbound TLS to `google_ip`.
+    /// Empty / missing = auto-expand from `front_domain` (current default of
+    /// {www, mail, drive, docs, calendar}.google.com). Set to an explicit list
+    /// to pick exactly which SNI names get rotated through — useful when one
+    /// of the defaults is locally blocked (e.g. mail.google.com in Iran at
+    /// various times). Can be tested per-name via the UI or `mhrv-rs test-sni`.
+    #[serde(default)]
+    pub sni_hosts: Option<Vec<String>>,
 }
 
 fn default_google_ip() -> String {

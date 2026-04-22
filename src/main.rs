@@ -26,6 +26,7 @@ enum Command {
     Serve,
     Test,
     ScanIps,
+    TestSni,
 }
 
 fn print_help() {
@@ -36,6 +37,7 @@ USAGE:
     mhrv-rs [OPTIONS]                  Start the proxy server (default)
     mhrv-rs test [OPTIONS]             Probe the Apps Script relay end-to-end
     mhrv-rs scan-ips [OPTIONS]         Scan Google frontend IPs for reachability + latency
+    mhrv-rs test-sni [OPTIONS]         Probe each SNI name in the rotation pool against google_ip
 
 OPTIONS:
     -c, --config PATH    Path to config.json (default: ./config.json)
@@ -66,6 +68,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "scan-ips" => {
                 command = Command::ScanIps;
+                raw.remove(0);
+            }
+            "test-sni" => {
+                command = Command::TestSni;
                 raw.remove(0);
             }
             _ => {}
@@ -166,6 +172,10 @@ async fn main() -> ExitCode {
         }
         Command::ScanIps => {
             let ok = scan_ips::run(&config).await;
+            return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        }
+        Command::TestSni => {
+            let ok = mhrv_rs::scan_sni::run(&config).await;
             return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
         }
         Command::Serve => {}
