@@ -49,7 +49,9 @@ For a handful of Google-owned domains (`google.com`, `youtube.com`, `fonts.googl
 
 Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
 
-**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md) (English) or [docs/android.fa.md](docs/android.fa.md) (فارسی). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes through the proxy without per-app configuration.
+**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md) (English) or [docs/android.fa.md](docs/android.fa.md) (فارسی). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes its IP traffic through the proxy without per-app configuration.
+
+> **Important Android caveat (issues #74 / #81):** while TUN captures all IP traffic, _HTTPS_ traffic from third-party apps still only works for apps that trust user-installed CAs. From Android 7 onward (which covers all supported devices — `minSdk = 24`), apps must opt in via `networkSecurityConfig` to trust the MITM CA we install. **Chrome and Firefox do**; **Telegram, WhatsApp, Instagram, YouTube, banking apps, games** do not. For those apps, either use `PROXY_ONLY` mode and point their in-app proxy at `127.0.0.1:1081` (SOCKS5), use `google_only` mode (no CA required, Google services only), or set `upstream_socks5` to an external VPS. This is an Android security design, not a bug in this client — same limit applies to every other MITM proxy on the platform.
 
 ## What's in a release
 
