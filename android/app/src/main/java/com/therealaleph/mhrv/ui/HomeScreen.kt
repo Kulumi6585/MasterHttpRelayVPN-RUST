@@ -851,16 +851,30 @@ private fun SniPoolEditor(
                 value = custom,
                 onValueChange = { custom = it },
                 label = { Text(stringResource(R.string.field_add_custom_sni)) },
-                singleLine = true,
+                // Accept a pasted list — users (issue #47) want to dump a
+                // whole list of subdomains in one go. We split on newlines,
+                // commas, semicolons, and whitespace so formats like
+                //   www.google.com\nmail.google.com\ndrive.google.com
+                //   www.google.com, mail.google.com
+                //   www.google.com mail.google.com
+                // all do the right thing on Add.
+                singleLine = false,
+                maxLines = 6,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.weight(1f),
             )
             TextButton(
                 onClick = {
-                    val s = custom.trim()
-                    if (s.isNotEmpty()) {
-                        val next = (cfg.sniHosts.takeIf { it.isNotEmpty() } ?: enabledSet.toList()) + s
-                        onChange(cfg.copy(sniHosts = next.distinct()))
+                    // Tokenise on any whitespace, comma, or semicolon so one
+                    // Add click absorbs a pasted list. Deduplicate within
+                    // the paste before merging into the existing list.
+                    val tokens = custom.split(Regex("[\\s,;]+"))
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                    if (tokens.isNotEmpty()) {
+                        val base = cfg.sniHosts.takeIf { it.isNotEmpty() } ?: enabledSet.toList()
+                        val next = (base + tokens).distinct()
+                        onChange(cfg.copy(sniHosts = next))
                         custom = ""
                     }
                 },
