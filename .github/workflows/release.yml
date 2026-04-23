@@ -150,16 +150,22 @@ jobs:
             cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
           sudo chown -R "$(id -u):$(id -g)" target
 
-      # OpenWRT MT7621 / mipsel-softfloat. The messense image tag
-      # `mipsel-musl-softfloat` ships a toolchain that emits soft-float
-      # insn exclusively — matches the MT7621's FPU-less reality.
-      # Requires Rust nightly + -Z build-std because mipsel is tier 3
-      # in the stable channel, which means no pre-built std.
+      # OpenWRT MT7621 / mipsel-softfloat. messense doesn't publish a
+      # `:mipsel-musl-softfloat` tag — the mipsel-musl image is
+      # hardfloat. We build soft-float anyway via
+      # `RUSTFLAGS=-C target-feature=+soft-float` + `-Z build-std` so
+      # libstd itself is recompiled to emit soft-float code. The
+      # gcc/musl shipping in the image is hardfloat but we never link
+      # anything more than libc (`ring` is pure asm for the crypto
+      # that matters), so musl's lack of softfloat libm doesn't bite.
+      # Requires nightly Rust since mipsel is Rust tier 3 in the
+      # stable channel — no prebuilt std.
       - name: Build CLI (mipsel-softfloat via docker)
         if: matrix.target == 'mipsel-unknown-linux-musl' && matrix.mipsel_softfloat == true
         run: |
           docker run --rm -v "$PWD":/src -w /src \
-            messense/rust-musl-cross:mipsel-musl-softfloat \
+            -e RUSTFLAGS='-C target-feature=+soft-float' \
+            messense/rust-musl-cross:mipsel-musl \
             sh -c "rustup toolchain install nightly --profile minimal --component rust-src && \
                    cargo +nightly build --release \
                      -Z build-std=std,panic_abort \
