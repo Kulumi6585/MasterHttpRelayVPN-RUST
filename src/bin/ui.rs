@@ -212,6 +212,7 @@ struct FormState {
     scan_batch_size:usize,
     google_ip_validation: bool,
     normalize_x_graphql: bool,
+    youtube_via_relay: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +290,7 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation: c.google_ip_validation,
             scan_batch_size:c.scan_batch_size,
             normalize_x_graphql: c.normalize_x_graphql,
+            youtube_via_relay: c.youtube_via_relay,
         }
     } else {
         FormState {
@@ -314,6 +316,7 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation:true,
             scan_batch_size:500,
             normalize_x_graphql: false,
+            youtube_via_relay: false,
         }
     };
     (form, load_err)
@@ -449,6 +452,10 @@ impl FormState {
             google_ip_validation:self.google_ip_validation,
             scan_batch_size:self.scan_batch_size,
             normalize_x_graphql: self.normalize_x_graphql,
+            // UI form doesn't expose youtube_via_relay yet — it's a
+            // config-only flag for now. Passed through from the loaded
+            // config if set, otherwise defaults to false.
+            youtube_via_relay: self.youtube_via_relay,
         })
     }
 }
@@ -487,6 +494,8 @@ struct ConfigWire<'a> {
     sni_hosts: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "is_false")]
     normalize_x_graphql: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    youtube_via_relay: bool,
     // IP-scan knobs. These used to be missing from the wire struct, so
     // every Save-config silently dropped them — the user would toggle
     // "fetch from API" on, save, reopen, and find it off again. Add
@@ -538,6 +547,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect()),
             normalize_x_graphql: c.normalize_x_graphql,
+            youtube_via_relay: c.youtube_via_relay,
             fetch_ips_from_api: c.fetch_ips_from_api,
             max_ips_to_scan: c.max_ips_to_scan,
             scan_batch_size: c.scan_batch_size,
