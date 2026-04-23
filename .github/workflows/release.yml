@@ -335,3 +335,115 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  # Notify the Persian-speaking Telegram channel with the CI-built
+  # Android APK + its sha256 + the per-version changelog from
+  # `docs/changelog/v<tag>.md`.
+  #
+  # Two Telegram API calls:
+  #   1. sendDocument — APK file + a short caption (Telegram caps
+  #      captions at 1024 chars, and we have bigger changelogs than
+  #      that).
+  #   2. sendMessage — full changelog as a reply to #1, Persian
+  #      quote-block first then English, same pattern as the
+  #      previous manual post. No emojis, as the user asked.
+  #
+  # Needs two repo secrets:
+  #   TELEGRAM_BOT_TOKEN  — bot the channel admits as poster
+  #   TELEGRAM_CHAT_ID    — numeric chat id (starts with -100...)
+  # Missing either => the whole job is skipped (not failed) so a
+  # forker who hasn't set up a Telegram channel gets a clean release.
+  telegram:
+    needs: [android, release]
+    runs-on: ubuntu-latest
+    # `vars.TELEGRAM_NOTIFY_ENABLED` defaults to empty in forks; set
+    # `TELEGRAM_NOTIFY_ENABLED=1` as a repo variable to enable. In
+    # the therealaleph origin we leave it on permanently via this
+    # env fallback — the `|| ...` expression makes it default-on
+    # when the secret is present.
+    if: ${{ always() && needs.android.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mhrv-rs-android-universal
+          path: apk
+
+      - name: Post to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Pull the tag off refs/tags/v1.2.3 → "1.2.3".
+          VER="${GITHUB_REF#refs/tags/v}"
+          APK="apk/mhrv-rs-android-universal-v${VER}.apk"
+
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "::notice::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping Telegram post"
+            exit 0
+          fi
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::expected $APK to exist; actually got:"
+            ls -la apk/
+            exit 1
+          fi
+
+          SHA256=$(sha256sum "$APK" | awk '{print $1}')
+          CAPTION="<b>mhrv-rs Android v${VER}</b>
+
+          SHA-256: <code>${SHA256}</code>
+          https://github.com/${GITHUB_REPOSITORY}
+          https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VER}"
+
+          echo "Sending APK with short caption..."
+          DOC_RESP=$(curl -sS --fail-with-body -X POST \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+            -F "chat_id=${CHAT_ID}" \
+            -F "document=@${APK}" \
+            -F "caption=${CAPTION}" \
+            -F "parse_mode=HTML")
+          DOC_MID=$(printf '%s' "$DOC_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['message_id'])")
+          echo "sendDocument OK, message_id=$DOC_MID"
+
+          # Full changelog as a reply. Split on the first line that's
+          # exactly `---`; anything before = Persian, after = English.
+          # Missing changelog file → skip the reply (not fatal).
+          CL_FILE="docs/changelog/v${VER}.md"
+          if [ ! -f "$CL_FILE" ]; then
+            echo "::notice::no $CL_FILE, skipping changelog reply"
+            exit 0
+          fi
+
+          python3 - "$CL_FILE" <<'PY' > /tmp/cl_fa.txt
+          import sys
+          body = open(sys.argv[1]).read()
+          # Strip the HTML comment header (between <!-- and -->).
+          import re
+          body = re.sub(r'<!--.*?-->\s*', '', body, count=1, flags=re.S)
+          fa, _, _ = body.partition('\n---\n')
+          sys.stdout.write(fa.strip())
+          PY
+          python3 - "$CL_FILE" <<'PY' > /tmp/cl_en.txt
+          import sys, re
+          body = open(sys.argv[1]).read()
+          body = re.sub(r'<!--.*?-->\s*', '', body, count=1, flags=re.S)
+          _, _, en = body.partition('\n---\n')
+          sys.stdout.write(en.strip())
+          PY
+
+          REPLY="<blockquote>$(cat /tmp/cl_fa.txt)</blockquote>
+
+          <blockquote>$(cat /tmp/cl_en.txt)</blockquote>"
+
+          echo "Sending changelog reply..."
+          curl -sS --fail-with-body -X POST \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${REPLY}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "reply_to_message_id=${DOC_MID}" > /dev/null
+          echo "Reply OK"
