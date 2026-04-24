@@ -56,6 +56,12 @@ function _doTunnel(req) {
       payload.host = req.h;
       payload.port = req.p;
       break;
+    case "connect_data":
+      payload.op = "connect_data";
+      payload.host = req.h;
+      payload.port = req.p;
+      if (req.d) payload.data = req.d;
+      break;
     case "data":
       payload.op = "data";
       payload.sid = req.sid;
@@ -66,7 +72,10 @@ function _doTunnel(req) {
       payload.sid = req.sid;
       break;
     default:
-      return _json({ e: "unknown tunnel op: " + req.t });
+      // Structured `code` lets the Rust client detect version skew
+      // without substring-matching the error text. Must match
+      // CODE_UNSUPPORTED_OP in tunnel_client.rs and tunnel-node/src/main.rs.
+      return _json({ e: "unknown tunnel op: " + req.t, code: "UNSUPPORTED_OP" });
   }
 
   var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel", {

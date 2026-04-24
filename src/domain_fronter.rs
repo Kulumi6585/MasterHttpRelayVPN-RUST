@@ -180,6 +180,11 @@ pub struct TunnelResponse {
     pub eof: Option<bool>,
     #[serde(default)]
     pub e: Option<String>,
+    /// Structured error code from the tunnel-node (e.g. `UNSUPPORTED_OP`).
+    /// `None` for legacy tunnel-nodes; clients should fall back to parsing
+    /// `e` only when this is `None` and compatibility is needed.
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 /// A single op in a batch tunnel request.
