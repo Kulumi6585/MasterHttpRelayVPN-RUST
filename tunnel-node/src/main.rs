@@ -26,6 +26,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+
+/// Structured error code returned when the tunnel-node receives an op it
+/// doesn't recognize. Clients use this (rather than string-matching `e`) to
+/// detect a version mismatch and gracefully fall back.
+const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
 
 // ---------------------------------------------------------------------------
 // Session
@@ -137,17 +143,25 @@ struct TunnelRequest {
     #[serde(default)] data: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 struct TunnelResponse {
     #[serde(skip_serializing_if = "Option::is_none")] sid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] d: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] eof: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] e: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] code: Option<String>,
 }
 
 impl TunnelResponse {
     fn error(msg: impl Into<String>) -> Self {
-        Self { sid: None, d: None, eof: None, e: Some(msg.into()) }
+        Self { sid: None, d: None, eof: None, e: Some(msg.into()), code: None }
+    }
+    fn unsupported_op(op: &str) -> Self {
+        Self {
+            sid: None, d: None, eof: None,
+            e: Some(format!("unknown op: {}", op)),
+            code: Some(CODE_UNSUPPORTED_OP.into()),
+        }
     }
 }
 
@@ -188,9 +202,12 @@ async fn handle_tunnel(
     }
     match req.op.as_str() {
         "connect" => Json(handle_connect(&state, req.host, req.port).await),
+        "connect_data" => {
+            Json(handle_connect_data_single(&state, req.host, req.port, req.data).await)
+        }
         "data" => Json(handle_data_single(&state, req.sid, req.data).await),
         "close" => Json(handle_close(&state, req.sid).await),
-        other => Json(TunnelResponse::error(format!("unknown op: {}", other))),
+        other => Json(TunnelResponse::unsupported_op(other)),
     }
 }
 
@@ -238,15 +255,51 @@ async fn handle_batch(
     // then do a short sleep to let servers respond, then drain all.
     // This batches the network round trips on the server side too.
 
-    // Phase 1: process connects and writes
+    // Phase 1: process connects and writes.
+    //
+    // `connect` and `connect_data` ops each establish a brand-new upstream
+    // TCP connection which can take up to 10 s (create_session timeout).
+    // Running them inline head-of-line-blocks every other op in the batch,
+    // so we dispatch both into a JoinSet and await them concurrently below.
+    //
+    // `connect_data` is expected to dominate in practice (new client) but
+    // we still hit `connect` from older clients or from server-speaks-first
+    // ports that skip the pre-read — if a slow `connect` landed in the same
+    // batch as data-bearing ops it could stall everyone.
     let mut results: Vec<(usize, TunnelResponse)> = Vec::with_capacity(req.ops.len());
     let mut data_ops: Vec<(usize, String)> = Vec::new(); // (index, sid) for data ops needing drain
+
+    enum NewConn {
+        Connect(TunnelResponse),
+        ConnectData(Result<String, TunnelResponse>),
+    }
+    let mut new_conn_jobs: JoinSet<(usize, NewConn)> = JoinSet::new();
 
     for (i, op) in req.ops.iter().enumerate() {
         match op.op.as_str() {
             "connect" => {
-                let r = handle_connect(&state, op.host.clone(), op.port).await;
-                results.push((i, r));
+                let state = state.clone();
+                let host = op.host.clone();
+                let port = op.port;
+                new_conn_jobs.spawn(async move {
+                    (i, NewConn::Connect(handle_connect(&state, host, port).await))
+                });
+            }
+            "connect_data" => {
+                let state = state.clone();
+                let host = op.host.clone();
+                let port = op.port;
+                let d = op.d.clone();
+                new_conn_jobs.spawn(async move {
+                    // Drop the returned Arc<SessionInner>: phase 2 below
+                    // holds the sessions-map lock once for the whole batch
+                    // and re-looks up each sid, which is cheap. The Arc
+                    // return is a convenience for the single-op path only.
+                    let r = handle_connect_data_phase1(&state, host, port, d)
+                        .await
+                        .map(|(sid, _inner)| sid);
+                    (i, NewConn::ConnectData(r))
+                });
             }
             "data" => {
                 let sid = match &op.sid {
@@ -273,7 +326,9 @@ async fn handle_batch(
                     data_ops.push((i, sid));
                 } else {
                     drop(sessions);
-                    results.push((i, TunnelResponse { sid: Some(sid), d: None, eof: Some(true), e: None }));
+                    results.push((i, TunnelResponse {
+                        sid: Some(sid), d: None, eof: Some(true), e: None, code: None,
+                    }));
                 }
             }
             "close" => {
@@ -281,7 +336,21 @@ async fn handle_batch(
                 results.push((i, r));
             }
             other => {
-                results.push((i, TunnelResponse::error(format!("unknown op: {}", other))));
+                results.push((i, TunnelResponse::unsupported_op(other)));
+            }
+        }
+    }
+
+    // Await all concurrent connect / connect_data jobs. For connect_data,
+    // successful ones join the data-drain set in phase 2; plain connects
+    // go straight to results because they have no initial data to drain.
+    while let Some(join) = new_conn_jobs.join_next().await {
+        match join {
+            Ok((i, NewConn::Connect(r))) => results.push((i, r)),
+            Ok((i, NewConn::ConnectData(Ok(sid)))) => data_ops.push((i, sid)),
+            Ok((i, NewConn::ConnectData(Err(r)))) => results.push((i, r)),
+            Err(e) => {
+                tracing::error!("new-connection task panicked: {}", e);
             }
         }
     }
@@ -304,12 +373,12 @@ async fn handle_batch(
                         results.push((*i, TunnelResponse {
                             sid: Some(sid.clone()),
                             d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
-                            eof: Some(eof), e: None,
+                            eof: Some(eof), e: None, code: None,
                         }));
                     }
                 } else {
                     results.push((*i, TunnelResponse {
-                        sid: Some(sid.clone()), d: None, eof: Some(true), e: None,
+                        sid: Some(sid.clone()), d: None, eof: Some(true), e: None, code: None,
                     }));
                 }
             }
@@ -325,11 +394,11 @@ async fn handle_batch(
                         results.push((*i, TunnelResponse {
                             sid: Some(sid.clone()),
                             d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
-                            eof: Some(eof), e: None,
+                            eof: Some(eof), e: None, code: None,
                         }));
                     } else {
                         results.push((*i, TunnelResponse {
-                            sid: Some(sid.clone()), d: None, eof: Some(true), e: None,
+                            sid: Some(sid.clone()), d: None, eof: Some(true), e: None, code: None,
                         }));
                     }
                 }
@@ -372,14 +441,25 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
 // Shared op handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16>) -> TunnelResponse {
+fn validate_host_port(
+    host: Option<String>,
+    port: Option<u16>,
+) -> Result<(String, u16), TunnelResponse> {
     let host = match host {
         Some(h) if !h.is_empty() => h,
-        _ => return TunnelResponse::error("missing host"),
+        _ => return Err(TunnelResponse::error("missing host")),
     };
     let port = match port {
         Some(p) if p > 0 => p,
-        _ => return TunnelResponse::error("missing or invalid port"),
+        _ => return Err(TunnelResponse::error("missing or invalid port")),
+    };
+    Ok((host, port))
+}
+
+async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16>) -> TunnelResponse {
+    let (host, port) = match validate_host_port(host, port) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     let session = match create_session(&host, port).await {
         Ok(s) => s,
@@ -388,7 +468,82 @@ async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16
     let sid = uuid::Uuid::new_v4().to_string();
     tracing::info!("session {} -> {}:{}", sid, host, port);
     state.sessions.lock().await.insert(sid.clone(), session);
-    TunnelResponse { sid: Some(sid), d: None, eof: Some(false), e: None }
+    TunnelResponse { sid: Some(sid), d: None, eof: Some(false), e: None, code: None }
+}
+
+/// Open a session and write the client's first bytes in one round trip.
+/// Returns the new sid plus an `Arc<SessionInner>` so unary callers
+/// (`handle_connect_data_single`) can drain the first response without a
+/// second sessions-map lookup. The batch caller drops the Arc — it takes
+/// a single lock across all drain-bound sessions in phase 2, which is
+/// cheaper than the Arc plumbing would be.
+async fn handle_connect_data_phase1(
+    state: &AppState,
+    host: Option<String>,
+    port: Option<u16>,
+    data: Option<String>,
+) -> Result<(String, Arc<SessionInner>), TunnelResponse> {
+    let (host, port) = validate_host_port(host, port)?;
+
+    let session = create_session(&host, port)
+        .await
+        .map_err(|e| TunnelResponse::error(format!("connect failed: {}", e)))?;
+
+    // Any failure below this point must abort the reader task, otherwise
+    // the newly-opened upstream TCP connection would leak. Keep the
+    // abort paths explicit rather than burying them in `.map_err`.
+    if let Some(ref data_b64) = data {
+        if !data_b64.is_empty() {
+            let bytes = match B64.decode(data_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    session.reader_handle.abort();
+                    return Err(TunnelResponse::error(format!("bad base64: {}", e)));
+                }
+            };
+            if !bytes.is_empty() {
+                let mut w = session.inner.writer.lock().await;
+                if let Err(e) = w.write_all(&bytes).await {
+                    drop(w);
+                    session.reader_handle.abort();
+                    return Err(TunnelResponse::error(format!("write failed: {}", e)));
+                }
+                let _ = w.flush().await;
+            }
+        }
+    }
+
+    let inner = session.inner.clone();
+    let sid = uuid::Uuid::new_v4().to_string();
+    tracing::info!("session {} -> {}:{} (connect_data)", sid, host, port);
+    state.sessions.lock().await.insert(sid.clone(), session);
+    Ok((sid, inner))
+}
+
+async fn handle_connect_data_single(
+    state: &AppState,
+    host: Option<String>,
+    port: Option<u16>,
+    data: Option<String>,
+) -> TunnelResponse {
+    let (sid, inner) = match handle_connect_data_phase1(state, host, port, data).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let (data, eof) = wait_and_drain(&inner, Duration::from_secs(5)).await;
+    if eof {
+        if let Some(s) = state.sessions.lock().await.remove(&sid) {
+            s.reader_handle.abort();
+            tracing::info!("session {} closed by remote", sid);
+        }
+    }
+    TunnelResponse {
+        sid: Some(sid),
+        d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        eof: Some(eof),
+        e: None,
+        code: None,
+    }
 }
 
 async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<String>) -> TunnelResponse {
@@ -428,7 +583,7 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
     TunnelResponse {
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
-        eof: Some(eof), e: None,
+        eof: Some(eof), e: None, code: None,
     }
 }
 
@@ -441,7 +596,7 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         s.reader_handle.abort();
         tracing::info!("session {} closed by client", sid);
     }
-    TunnelResponse { sid: Some(sid), d: None, eof: Some(true), e: None }
+    TunnelResponse { sid: Some(sid), d: None, eof: Some(true), e: None, code: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,3 +675,129 @@ async fn main() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn fresh_state() -> AppState {
+        AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            auth_key: "test-key".into(),
+        }
+    }
+
+    /// Spin up a one-shot TCP server that echoes everything it reads back
+    /// with a `"ECHO: "` prefix, then returns the bound port.
+    async fn start_echo_server() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let mut out = b"ECHO: ".to_vec();
+                    out.extend_from_slice(&buf[..n]);
+                    let _ = sock.write_all(&out).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn unsupported_op_response_has_structured_code() {
+        let resp = TunnelResponse::unsupported_op("connect_data");
+        assert_eq!(resp.code.as_deref(), Some(CODE_UNSUPPORTED_OP));
+        assert_eq!(resp.e.as_deref(), Some("unknown op: connect_data"));
+    }
+
+    #[tokio::test]
+    async fn validate_host_port_rejects_empty_and_zero() {
+        assert!(validate_host_port(None, Some(443)).is_err());
+        assert!(validate_host_port(Some("".into()), Some(443)).is_err());
+        assert!(validate_host_port(Some("x".into()), None).is_err());
+        assert!(validate_host_port(Some("x".into()), Some(0)).is_err());
+        assert_eq!(
+            validate_host_port(Some("host".into()), Some(443)).unwrap(),
+            ("host".to_string(), 443),
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_data_phase1_writes_initial_data_and_returns_inner() {
+        let port = start_echo_server().await;
+        let state = fresh_state();
+
+        let (sid, inner) = handle_connect_data_phase1(
+            &state,
+            Some("127.0.0.1".into()),
+            Some(port),
+            Some(B64.encode(b"hello")),
+        )
+        .await
+        .expect("phase1 should succeed");
+
+        // Session was inserted.
+        assert!(state.sessions.lock().await.contains_key(&sid));
+
+        // Echo server sent back "ECHO: hello". Use wait_and_drain on the
+        // returned Arc — no map re-lookup needed (this is the fix).
+        let (data, _eof) = wait_and_drain(&inner, Duration::from_secs(2)).await;
+        assert_eq!(&data[..], b"ECHO: hello");
+    }
+
+    #[tokio::test]
+    async fn connect_data_single_bundles_connect_and_first_bytes() {
+        let port = start_echo_server().await;
+        let state = fresh_state();
+
+        let resp = handle_connect_data_single(
+            &state,
+            Some("127.0.0.1".into()),
+            Some(port),
+            Some(B64.encode(b"world")),
+        )
+        .await;
+
+        assert!(resp.e.is_none(), "unexpected error: {:?}", resp.e);
+        assert!(resp.sid.is_some());
+        let decoded = B64.decode(resp.d.unwrap()).unwrap();
+        assert_eq!(&decoded[..], b"ECHO: world");
+    }
+
+    #[tokio::test]
+    async fn connect_data_rejects_missing_host() {
+        let state = fresh_state();
+        let resp = handle_connect_data_single(
+            &state, None, Some(443), Some(B64.encode(b"x")),
+        ).await;
+        assert!(resp.e.as_deref().unwrap_or("").contains("missing host"));
+        assert!(state.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_data_rejects_bad_base64_and_does_not_leak_session() {
+        // Need a live target so we reach the base64-decode step after
+        // create_session succeeds — otherwise we'd fail earlier.
+        let port = start_echo_server().await;
+        let state = fresh_state();
+        let resp = handle_connect_data_single(
+            &state,
+            Some("127.0.0.1".into()),
+            Some(port),
+            Some("!!!not base64!!!".into()),
+        )
+        .await;
+        assert!(resp.e.as_deref().unwrap_or("").contains("bad base64"));
+        // Session should NOT be in the map since phase1 rejected it.
+        assert!(state.sessions.lock().await.is_empty());
+    }
+}
+
