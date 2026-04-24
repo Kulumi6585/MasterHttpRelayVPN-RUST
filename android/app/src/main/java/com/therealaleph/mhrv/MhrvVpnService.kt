@@ -160,38 +160,39 @@ class MhrvVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
             .setBlocking(false)
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (e: Throwable) {
-            // Shouldn't happen for our own package, but don't hard-fail.
-            Log.w(TAG, "addDisallowedApplication failed: ${e.message}")
-        }
 
-        // Apply user-chosen app splitting on top of the mandatory
-        // self-exclusion above.
+        // Apply user-chosen app splitting. The VpnService API treats
+        // addAllowedApplication and addDisallowedApplication as mutually
+        // exclusive — calling both on one Builder throws
+        // IllegalArgumentException at establish() time, which is the bug
+        // that manifested as "ONLY mode tunnels everything" (establish()
+        // failed silently and the fallback never routed correctly).
         //
-        //   ALL    — no extra restriction; every other app routes through
-        //            us. Matches pre-splitting behaviour.
-        //   ONLY   — allow-list. addAllowedApplication() for each chosen
-        //            package; anything missing from the list bypasses the
-        //            VPN on the OS-native route. Note that ONLY and the
-        //            mandatory self-exclude are mutually exclusive in the
-        //            VpnService API, so if the user also put us in the
-        //            allow-list we skip the self-exclude (it's already
-        //            implicit via "we're not in the list").
-        //   EXCEPT — deny-list. addDisallowedApplication() for each chosen
-        //            package, additive with our self-exclude.
+        // ALL / EXCEPT: add the mandatory self-exclude (packageName) via
+        // addDisallowedApplication so our own proxy's outbound to
+        // google_ip doesn't loop through the TUN.
+        // ONLY: self-exclusion is implicit — we're not in the allow-list.
         //
         // Packages that are not installed (leftover selections from a
         // previous device) throw PackageManager.NameNotFoundException —
         // we log and skip rather than aborting the whole VPN start.
         when (cfg.splitMode) {
-            SplitMode.ALL -> { /* no-op */ }
+            SplitMode.ALL -> {
+                try {
+                    builder.addDisallowedApplication(packageName)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "addDisallowedApplication(self) failed: ${e.message}")
+                }
+            }
             SplitMode.ONLY -> {
                 if (cfg.splitApps.isEmpty()) {
                     Log.w(TAG, "ONLY mode with empty splitApps list — no app would get the VPN; falling back to ALL")
+                    try {
+                        builder.addDisallowedApplication(packageName)
+                    } catch (_: Throwable) {}
                 } else {
                     for (pkg in cfg.splitApps) {
+                        if (pkg == packageName) continue  // can't tunnel ourselves
                         try { builder.addAllowedApplication(pkg) } catch (e: Throwable) {
                             Log.w(TAG, "addAllowedApplication($pkg) failed: ${e.message}")
                         }
@@ -199,6 +200,11 @@ class MhrvVpnService : VpnService() {
                 }
             }
             SplitMode.EXCEPT -> {
+                try {
+                    builder.addDisallowedApplication(packageName)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "addDisallowedApplication(self) failed: ${e.message}")
+                }
                 for (pkg in cfg.splitApps) {
                     if (pkg == packageName) continue  // already self-excluded above
                     try { builder.addDisallowedApplication(pkg) } catch (e: Throwable) {
