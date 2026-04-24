@@ -2,9 +2,10 @@
 //!
 //! A central multiplexer collects pending data from ALL active sessions
 //! and fires batch requests without waiting for the previous one to return.
-//! Pipeline depth equals the number of script deployments (minimum 2),
-//! so users with more deployments get lower latency automatically.
+//! Each Apps Script deployment (account) gets its own concurrency pool of
+//! 30 in-flight requests — matching the per-account Apps Script limit.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::domain_fronter::{BatchOp, DomainFronter, TunnelResponse};
 
-/// Minimum pipeline depth even with a single script.
-const MIN_PIPELINE_DEPTH: usize = 2;
+/// Apps Script allows 30 concurrent executions per account / deployment.
+const CONCURRENCY_PER_DEPLOYMENT: usize = 30;
 
 /// Maximum total base64-encoded payload bytes in a single batch request.
 /// Apps Script accepts up to 50 MB per fetch, but the tunnel-node must
@@ -66,14 +67,14 @@ pub struct TunnelMux {
 
 impl TunnelMux {
     pub fn start(fronter: Arc<DomainFronter>) -> Arc<Self> {
-        let pipeline_depth = fronter.num_scripts().max(MIN_PIPELINE_DEPTH);
+        let n = fronter.num_scripts();
         tracing::info!(
-            "tunnel mux: pipeline_depth={} (from {} script deployments)",
-            pipeline_depth,
-            fronter.num_scripts()
+            "tunnel mux: {} deployment(s), {} concurrent per deployment",
+            n,
+            CONCURRENCY_PER_DEPLOYMENT
         );
         let (tx, rx) = mpsc::channel(512);
-        tokio::spawn(mux_loop(rx, fronter, pipeline_depth));
+        tokio::spawn(mux_loop(rx, fronter));
         Arc::new(Self { tx })
     }
 
@@ -85,9 +86,15 @@ impl TunnelMux {
 async fn mux_loop(
     mut rx: mpsc::Receiver<MuxMsg>,
     fronter: Arc<DomainFronter>,
-    pipeline_depth: usize,
 ) {
-    let sem = Arc::new(Semaphore::new(pipeline_depth));
+    // One semaphore per deployment ID, each allowing 30 concurrent requests.
+    let sems: Arc<HashMap<String, Arc<Semaphore>>> = Arc::new(
+        fronter
+            .script_id_list()
+            .iter()
+            .map(|id| (id.clone(), Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT))))
+            .collect(),
+    );
 
     loop {
         let mut msgs = Vec::new();
@@ -136,7 +143,7 @@ async fn mux_loop(
                             || batch_payload_bytes + op_bytes > MAX_BATCH_PAYLOAD_BYTES)
                     {
                         fire_batch(
-                            &sem,
+                            &sems,
                             &fronter,
                             std::mem::take(&mut data_ops),
                             std::mem::take(&mut data_replies),
@@ -176,22 +183,28 @@ async fn mux_loop(
             continue;
         }
 
-        fire_batch(&sem, &fronter, data_ops, data_replies).await;
+        fire_batch(&sems, &fronter, data_ops, data_replies).await;
     }
 }
 
-/// Acquire a pipeline slot and spawn a batch request task.
+/// Pick a deployment, acquire its per-account concurrency slot, and spawn
+/// a batch request task.
 ///
 /// The batch HTTP round-trip is bounded by `BATCH_TIMEOUT` so a slow or
 /// dead tunnel-node target cannot hold a pipeline slot (and block waiting
 /// sessions) forever.
 async fn fire_batch(
-    sem: &Arc<Semaphore>,
+    sems: &Arc<HashMap<String, Arc<Semaphore>>>,
     fronter: &Arc<DomainFronter>,
     data_ops: Vec<BatchOp>,
     data_replies: Vec<(usize, oneshot::Sender<Result<TunnelResponse, String>>)>,
 ) {
-    let permit = sem.clone().acquire_owned().await.unwrap();
+    let script_id = fronter.next_script_id();
+    let sem = sems
+        .get(&script_id)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT)));
+    let permit = sem.acquire_owned().await.unwrap();
     let f = fronter.clone();
 
     tokio::spawn(async move {
@@ -201,8 +214,12 @@ async fn fire_batch(
 
         // Bounded-wait: if the batch takes longer than BATCH_TIMEOUT,
         // all sessions in this batch get an error and can retry.
-        let result = tokio::time::timeout(BATCH_TIMEOUT, f.tunnel_batch_request(&data_ops)).await;
-        tracing::info!("batch: {} ops, rtt={:?}", n_ops, t0.elapsed());
+        let result = tokio::time::timeout(
+            BATCH_TIMEOUT,
+            f.tunnel_batch_request_to(&script_id, &data_ops),
+        )
+        .await;
+        tracing::info!("batch: {} ops → {}, rtt={:?}", n_ops, &script_id[..script_id.len().min(8)], t0.elapsed());
 
         match result {
             Ok(Ok(batch_resp)) => {

@@ -336,6 +336,10 @@ impl DomainFronter {
         self.script_ids.len()
     }
 
+    pub fn script_id_list(&self) -> &[String] {
+        &self.script_ids
+    }
+
     pub fn cache(&self) -> &ResponseCache {
         &self.cache
     }
@@ -344,7 +348,7 @@ impl DomainFronter {
         self.coalesced.load(Ordering::Relaxed)
     }
 
-    fn next_script_id(&self) -> String {
+    pub fn next_script_id(&self) -> String {
         let n = self.script_ids.len();
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
@@ -1170,13 +1174,24 @@ impl DomainFronter {
         &self,
         ops: &[BatchOp],
     ) -> Result<BatchTunnelResponse, FronterError> {
+        let script_id = self.next_script_id();
+        self.tunnel_batch_request_to(&script_id, ops).await
+    }
+
+    /// Like `tunnel_batch_request` but targets a specific deployment ID.
+    /// Used by the pipeline mux to pin a batch to a deployment whose
+    /// per-account concurrency slot has already been acquired.
+    pub async fn tunnel_batch_request_to(
+        &self,
+        script_id: &str,
+        ops: &[BatchOp],
+    ) -> Result<BatchTunnelResponse, FronterError> {
         let mut map = serde_json::Map::new();
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
         map.insert("ops".into(), serde_json::to_value(ops)?);
         let payload = serde_json::to_vec(&Value::Object(map))?;
 
-        let script_id = self.next_script_id();
         let path = format!("/macros/s/{}/exec", script_id);
 
         let mut entry = self.acquire().await?;

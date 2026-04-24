@@ -163,7 +163,7 @@ Firefox keeps its own cert store; the installer also drops the CA into Firefox's
 
 Open the UI and fill in the form:
 
-- **Apps Script ID** — the Deployment ID from Step 1. Add multiple IDs (one per line in the UI, or a JSON array in `config.json`) for higher quota **and** lower latency. In `apps_script` mode, IDs are round-robined. In `full` mode, more IDs directly increase the pipeline depth (see [Full tunnel mode](#full-tunnel-mode) below).
+- **Apps Script ID** — the Deployment ID from Step 1. Add multiple IDs (one per line in the UI, or a JSON array in `config.json`) for higher quota **and** lower latency. In `apps_script` mode, IDs are round-robined. In `full` mode, each deployment gets its own pool of 30 concurrent requests (the Apps Script per-account limit), so more IDs = more total throughput (see [Full tunnel mode](#full-tunnel-mode) below).
 - **Auth key** — the same secret you set in `Code.gs`.
 - **Google IP** — `216.239.38.120` is a solid default. Use the **scan** button to probe for a faster one from your network.
 - **Front domain** — keep `www.google.com`.
@@ -271,21 +271,20 @@ Full tunnel mode (`"mode": "full"`) routes **all** traffic end-to-end through Ap
 
 ### How deployment IDs affect performance
 
-Each Apps Script batch request takes ~2 seconds round-trip. In full mode, `mhrv-rs` runs a **pipelined batch multiplexer** that fires multiple batch requests concurrently without waiting for the previous one to return. The number of in-flight batches (the *pipeline depth*) scales directly with the number of deployment IDs you configure:
+Each Apps Script batch request takes ~2 seconds round-trip. In full mode, `mhrv-rs` runs a **pipelined batch multiplexer** that fires multiple batch requests concurrently without waiting for the previous one to return. Each deployment ID (= one Google account) gets its own concurrency pool of **30 in-flight requests** — matching the Apps Script per-account execution limit.
 
 ```
-pipeline_depth = number_of_script_ids  (minimum 2)
+max_concurrent = 30 × number_of_deployment_ids
 ```
 
-| Deployments | Pipeline depth | Effective batch interval | Notes |
-|-------------|---------------|------------------------|-------|
-| 1 | 2 | ~1.0s | Minimum — still pipelines 2 batches |
-| 3 | 3 | ~0.7s | Good for light browsing |
-| 6 | 6 | ~0.3s | Recommended for daily use |
-| 12 | 12 | ~0.17s | Sweet spot for most users |
-| 20 | 20 | ~0.10s | Multi-account setups |
+| Deployments | Concurrent requests | Notes |
+|-------------|-------------------|-------|
+| 1 | 30 | Single account — plenty for light browsing |
+| 3 | 90 | Good for daily use |
+| 6 | 180 | Recommended for heavy use |
+| 12 | 360 | Multi-account power setup |
 
-More deployments = more concurrent batches = lower per-session latency. Each batch round-robins across your deployment IDs, so the load is spread evenly and you're less likely to hit a single deployment's quota ceiling.
+More deployments = more total concurrency = lower per-session latency. Each batch round-robins across your deployment IDs, so the load is spread evenly and you're less likely to hit a single deployment's quota ceiling.
 
 **Resource guards** keep things safe:
 - **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
@@ -294,10 +293,10 @@ More deployments = more concurrent batches = lower per-session latency. Each bat
 
 ### Quick start
 
-1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) as **3–12 Web App deployments** (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). You can create multiple deployments on a single Google account — each "New deployment" produces its own ID. Going multi-account only matters for the daily quota (each Google account gets its own 20 000 `UrlFetchApp` calls/day on the free tier / 100 000 on Workspace); the pipeline depth itself scales fine on one account up to Apps Script's simultaneous-execution ceiling. Rule of thumb:
-   - **Solo use** → 3–6 deployments on one account is plenty
-   - **Shared with ~3 people** → 6 deployments on one account, bump to multi-account only if you start hitting quota alerts
-   - **Shared with a group** → one account per heavy user (each with 1–2 deployments) is the clean scaling path
+1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) as a **Web App deployment** on each Google account (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). Use **one deployment per Google account** — the 30-concurrent-request limit is per account, so multiple deployments on the same account share the same pool and don't add concurrency. To scale, add more accounts:
+   - **Solo use** → 1–2 accounts is plenty
+   - **Shared with ~3 people** → 3 accounts
+   - **Shared with a group** → one account per heavy user
 2. Deploy the [tunnel-node](tunnel-node/) on a VPS
 3. Set `"mode": "full"` in your config with all deployment IDs:
 
@@ -630,21 +629,20 @@ Donations cover hosting, self-hosted CI runner costs, and continued maintenance.
 
 #### چرا تعداد `Deployment ID` مهم است؟
 
-هر درخواست دسته‌ای (`batch`) به `Apps Script` حدود ۲ ثانیه طول می‌کشد. در حالت `full`، برنامه یک **لولهٔ موازی** (`pipeline`) اجرا می‌کند که چند درخواست دسته‌ای را همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. تعداد درخواست‌های همزمان مستقیماً با تعداد `Deployment ID`ها رابطه دارد:
+هر درخواست دسته‌ای (`batch`) به `Apps Script` حدود ۲ ثانیه طول می‌کشد. در حالت `full`، برنامه یک **لولهٔ موازی** (`pipeline`) اجرا می‌کند که چند درخواست دسته‌ای را همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. هر `Deployment ID` (= یک حساب گوگل) حوضچهٔ همزمانی مخصوص خودش با **۳۰ درخواست همزمان** دارد — مطابق سقف اجرای همزمان `Apps Script` به ازای هر حساب.
 
 ```
-عمق لوله = تعداد Deployment IDها  (حداقل ۲)
+حداکثر همزمانی = ۳۰ × تعداد Deployment IDها
 ```
 
-| تعداد Deployment | عمق لوله | فاصلهٔ مؤثر بین دسته‌ها | |
-|-----------------|----------|------------------------|---|
-| ۱ | ۲ | ~۱ ثانیه | حداقل |
-| ۳ | ۳ | ~۰.۷ ثانیه | مناسب مرور سبک |
-| ۶ | ۶ | ~۰.۳ ثانیه | توصیه‌شده برای استفادهٔ روزانه |
-| ۱۲ | ۱۲ | ~۰.۱۷ ثانیه | نقطهٔ بهینه |
-| ۲۰ | ۲۰ | ~۰.۱ ثانیه | چند حساب |
+| تعداد Deployment | درخواست‌های همزمان | |
+|-----------------|-------------------|---|
+| ۱ | ۳۰ | یک حساب — برای مرور سبک کافیست |
+| ۳ | ۹۰ | مناسب استفادهٔ روزانه |
+| ۶ | ۱۸۰ | توصیه‌شده برای استفادهٔ سنگین |
+| ۱۲ | ۳۶۰ | چند حساب — حداکثر توان |
 
-بیشتر `Deployment` = بیشتر درخواست همزمان = تأخیر کمتر برای هر نشست. هر دسته بین `ID`ها چرخش می‌کند (`round-robin`)، پس بار به‌طور یکنواخت توزیع می‌شود.
+بیشتر `Deployment` = بیشتر همزمانی = تأخیر کمتر برای هر نشست. هر دسته بین `ID`ها چرخش می‌کند (`round-robin`)، پس بار به‌طور یکنواخت توزیع می‌شود.
 
 ### اجرا روی OpenWRT (روتر)
 
@@ -700,7 +698,7 @@ logread -e mhrv-rs -f
 - **لینوکس:** فایل `/usr/local/share/ca-certificates/mhrv-rs.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
 
 **چند `Deployment ID` لازم دارم؟**
-یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. برای اکثر کاربران چند ساعت یوتیوب هم با یک `Deployment` کافی است. می‌توانید چند `Deployment` **در همان حساب** بسازید (هر بار `New deployment` یک `ID` جدید می‌دهد) — این روش در حالت `full` پهنای باند بهتری می‌دهد چون `pipeline depth` افزایش پیدا می‌کند و هر `Deployment` یک اجرای همزمان جدا در `Apps Script` می‌گیرد (تا سقف ۳۰ اجرای همزمان هر حساب). برای سهمیهٔ روزانهٔ بیشتر، در حساب‌های گوگل دیگر هم `Deployment` بسازید — هر حساب سهمیهٔ ۲۰ هزار درخواستی خودش را دارد. همهٔ `ID`ها را در فیلد `Apps Script ID(s)` وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
+یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. از هر حساب گوگل **فقط یک `Deployment`** بسازید — سقف ۳۰ درخواست همزمان به ازای هر حساب است، پس چند `Deployment` روی یک حساب همزمانی اضافه نمی‌کند. برای افزایش همزمانی یا سهمیهٔ روزانه، در حساب‌های گوگل دیگر `Deployment` بسازید — هر حساب سهمیهٔ ۲۰ هزار درخواستی و ۳۰ اجرای همزمان خودش را دارد. همهٔ `ID`ها را در فیلد `Apps Script ID(s)` وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
 
 **یوتوب کار می‌کند؟ ویدیو پخش می‌شود؟**
 صفحهٔ یوتوب سریع باز می‌شود (چون مستقیم از لبهٔ گوگل می‌آید). اما `chunk`های ویدیوی اصلی از `googlevideo.com` از طریق `Apps Script` می‌آیند و روزانه سهمیه دارند. برای تماشای گاه‌به‌گاه خوب است، برای ۱۰۸۰p پخش طولانی دردناک.
