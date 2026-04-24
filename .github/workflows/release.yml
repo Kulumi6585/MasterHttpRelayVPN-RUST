@@ -4,6 +4,21 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual re-trigger for the case where one matrix job (e.g. mipsel-softfloat)
+  # failed on the original tag push and we've since pushed the build fix to
+  # main but can't force-move the immutable tag (tag protection rule). Run
+  # this workflow manually with `version` set to the existing release tag —
+  # the build matrix runs against the current main, artifacts are uploaded
+  # to the matching release page, and the release-notes step is a no-op
+  # (release already exists). Pair with `gh variable set
+  # TELEGRAM_NOTIFY_ENABLED --body false` before dispatch if you don't want
+  # the channel re-pinged for what's effectively the same release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release tag to upload to (without the leading v). Example: 1.4.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -277,7 +292,12 @@ jobs:
       - name: Build macOS .app bundle
         if: runner.os == 'macOS'
         run: |
-          VER="${GITHUB_REF#refs/tags/v}"
+          # Tag push: $GITHUB_REF == "refs/tags/v1.4.0", strip "refs/tags/v".
+          # workflow_dispatch: inputs.version comes in as e.g. "1.4.0".
+          # Fall back to ref_name (the bare branch/tag name) and strip a
+          # possible leading "v" so both paths produce the bare version.
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
           ./assets/macos/build-app.sh dist/mhrv-rs-ui "$VER" dist
           # Make a clean zip of just the .app for the release
           cd dist
@@ -378,7 +398,8 @@ jobs:
       - name: Rename APKs with version
         working-directory: android
         run: |
-          VER="${GITHUB_REF#refs/tags/v}"
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
           mkdir -p ../dist
 
           # With splits.abi enabled in build.gradle.kts (issue #136), AGP
@@ -455,6 +476,14 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          # On tag push, action-gh-release defaults tag_name to the
+          # current ref. On workflow_dispatch the ref is `main` (or
+          # whichever branch we dispatched from), which would create a
+          # bogus release named "main"; force the tag explicitly so
+          # artifacts upload to the existing release identified by
+          # `inputs.version`. The leading `v` is preserved (release
+          # tags are `v1.4.0`, not `1.4.0`).
+          tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
           files: dist/*
           generate_release_notes: true
 
@@ -509,7 +538,8 @@ jobs:
         # 26. Python stdlib has no such wart.
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF#refs/tags/v}"
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
           APK="apk/mhrv-rs-android-universal-v${VER}.apk"
 
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
