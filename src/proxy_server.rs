@@ -1182,13 +1182,22 @@ where
     // x.com's GraphQL endpoints concatenate three huge JSON blobs into
     // the query string: `?variables=<json>&features=<json>&fieldToggles=<json>`.
     // The combined URL regularly exceeds Apps Script's URL length limit
-    // (it returns a generic "relay error" with no useful detail). The
-    // `variables=` portion alone is enough for x.com to serve the
-    // timeline — `features` / `fieldToggles` are client-capability
-    // hints it tolerates being absent. Truncating at the first `&`
-    // after `?variables=` ships a working request that fits under the
-    // limit. Ported from upstream Python 2d959d4 (p0u1ya's fix).
-    let path = if host.eq_ignore_ascii_case("x.com")
+    // (Apps Script returns "بیش از حد مجاز: طول نشانی وب URLFetch" /
+    // "URLFetch URL length exceeded"). The `variables=` portion alone
+    // is enough for x.com to serve the timeline — `features` /
+    // `fieldToggles` are client-capability hints it tolerates being
+    // absent. Truncating at the first `&` after `?variables=` ships a
+    // working request that fits under the limit. Ported from upstream
+    // Python 2d959d4 (p0u1ya's fix). Issue #64.
+    //
+    // Host matcher: browsers actually hit `www.x.com` (and sometimes
+    // `api.x.com`), not bare `x.com`. The original check only matched
+    // `x.com` exactly, so real traffic flew past the rewrite until
+    // pourya-p's log in #64 showed the real Host header. Match every
+    // subdomain of x.com here.
+    let host_lower = host.to_ascii_lowercase();
+    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com");
+    let path = if is_x_com
         && path.starts_with("/i/api/graphql/")
         && path.contains("?variables=")
     {
