@@ -952,7 +952,7 @@ impl eframe::App for App {
                 (
                     s.running,
                     s.started_at,
-                    s.last_stats,
+                    s.last_stats.clone(),
                     s.ca_trusted,
                     s.last_test_msg.clone(),
                     s.last_per_site.clone(),
@@ -966,7 +966,7 @@ impl eframe::App for App {
                 "Traffic  ·  (not running)".to_string()
             };
             section(ui, &status_title, |ui| {
-                if let Some(s) = stats {
+                if let Some(s) = &stats {
                     // Compact two-column layout so 7 metrics fit in ~4 rows
                     // instead of a tall vertical strip.
                     let rows: Vec<(&str, String)> = vec![
@@ -1029,6 +1029,85 @@ impl eframe::App for App {
                     );
                 }
             });
+
+            // ── Usage today (estimated) — daily budget tracker ───────────────
+            // Client-side estimate from our own atomic counters. Counts only
+            // successful relay calls this process saw since 00:00 UTC. Google's
+            // actual quota bucket is per-Apps-Script-project and per-Google
+            // account — if multiple devices share the same deployment, each
+            // client only sees its own share. We link to the Google dashboard
+            // for the authoritative number.
+            if let Some(s) = &stats {
+                ui.add_space(2.0);
+                section(ui, "Usage today (estimated)", |ui| {
+                    // Free-tier Apps Script UrlFetchApp quota. Workspace /
+                    // paid accounts get 100k but most users are on free.
+                    const FREE_QUOTA_PER_DAY: u64 = 20_000;
+                    let pct = if FREE_QUOTA_PER_DAY > 0 {
+                        (s.today_calls as f64 / FREE_QUOTA_PER_DAY as f64) * 100.0
+                    } else { 0.0 };
+                    let reset = s.today_reset_secs;
+                    let reset_str = format!(
+                        "{}h {}m",
+                        reset / 3600,
+                        (reset / 60) % 60,
+                    );
+                    let rows: Vec<(&str, String)> = vec![
+                        (
+                            "calls today",
+                            format!(
+                                "{} / {}  ({:.1}%)",
+                                s.today_calls, FREE_QUOTA_PER_DAY, pct
+                            ),
+                        ),
+                        ("bytes today", fmt_bytes(s.today_bytes)),
+                        ("UTC day", s.today_key.clone()),
+                        ("resets in", reset_str),
+                    ];
+                    egui::Grid::new("usage_today")
+                        .num_columns(4)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for chunk in rows.chunks(2) {
+                                for (label, value) in chunk.iter() {
+                                    ui.add_sized(
+                                        [110.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(*label)
+                                                .color(egui::Color32::from_gray(150)),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        [140.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(value).monospace(),
+                                        ),
+                                    );
+                                }
+                                if chunk.len() == 1 {
+                                    ui.label("");
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to(
+                            egui::RichText::new("View quota on Google →"),
+                            "https://script.google.com/home/usage",
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "  (authoritative — estimate is what this device relayed)",
+                            )
+                            .color(egui::Color32::from_gray(130))
+                            .italics()
+                            .small(),
+                        );
+                    });
+                });
+            }
 
             if !per_site.is_empty() {
                 ui.add_space(2.0);

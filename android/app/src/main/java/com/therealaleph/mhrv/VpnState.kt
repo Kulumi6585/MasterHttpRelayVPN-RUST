@@ -28,7 +28,20 @@ object VpnState {
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
+    /**
+     * Current native proxy handle for stats polling, or 0 if nothing is up.
+     * The service publishes this alongside `isRunning` so the Compose UI can
+     * call `Native.statsJson(handle)` without poking into the service's
+     * internal state. Reset to 0 on teardown so polling stops cleanly.
+     */
+    private val _proxyHandle = MutableStateFlow(0L)
+    val proxyHandle: StateFlow<Long> = _proxyHandle.asStateFlow()
+
     fun setRunning(running: Boolean) {
         _isRunning.value = running
+    }
+
+    fun setProxyHandle(handle: Long) {
+        _proxyHandle.value = handle
     }
 }

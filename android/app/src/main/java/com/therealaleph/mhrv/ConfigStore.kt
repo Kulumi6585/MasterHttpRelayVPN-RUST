@@ -94,6 +94,16 @@ data class MhrvConfig(
     val parallelRelay: Int = 1,
     val upstreamSocks5: String = "",
 
+    /**
+     * User-configured hostnames that bypass Apps Script relay entirely
+     * and plain-TCP passthrough (via upstreamSocks5 if set). Each entry
+     * is either an exact hostname ("example.com") or a leading-dot
+     * suffix (".example.com" → matches example.com + any subdomain).
+     * See `src/config.rs` `passthrough_hosts` for semantics.
+     * Issues #39, #127.
+     */
+    val passthroughHosts: List<String> = emptyList(),
+
     /** VPN_TUN (everything routed) vs PROXY_ONLY (user configures per-app). */
     val connectionMode: ConnectionMode = ConnectionMode.VPN_TUN,
 
@@ -173,6 +183,9 @@ data class MhrvConfig(
             if (upstreamSocks5.isNotBlank()) {
                 put("upstream_socks5", upstreamSocks5.trim())
             }
+            if (passthroughHosts.isNotEmpty()) {
+                put("passthrough_hosts", JSONArray().apply { passthroughHosts.forEach { put(it) } })
+            }
 
             // Phone-scoped scan defaults. We don't expose these in the UI
             // because a phone isn't where you'd run a full /16 scan; users
@@ -249,6 +262,9 @@ object ConfigStore {
                 logLevel = obj.optString("log_level", "info"),
                 parallelRelay = obj.optInt("parallel_relay", 1),
                 upstreamSocks5 = obj.optString("upstream_socks5", ""),
+                passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
+                    buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                }?.filter { it.isNotBlank() }.orEmpty(),
                 connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
                     "proxy_only" -> ConnectionMode.PROXY_ONLY
                     else -> ConnectionMode.VPN_TUN  // default for unknown/missing

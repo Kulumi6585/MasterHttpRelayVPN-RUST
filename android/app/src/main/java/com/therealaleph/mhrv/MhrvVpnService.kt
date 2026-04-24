@@ -137,6 +137,7 @@ class MhrvVpnService : VpnService() {
         // backgrounding. Issue #37.
         if (cfg.connectionMode == ConnectionMode.PROXY_ONLY) {
             Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
+            VpnState.setProxyHandle(proxyHandle)
             VpnState.setRunning(true)
             return
         }
@@ -258,6 +259,7 @@ class MhrvVpnService : VpnService() {
         // to observe. Only flipped true once everything above succeeded —
         // if we'd flipped it earlier the button would light up green for
         // a failed-to-establish run.
+        VpnState.setProxyHandle(proxyHandle)
         VpnState.setRunning(true)
     }
 
@@ -339,6 +341,7 @@ class MhrvVpnService : VpnService() {
         }
         // Flip UI state last — the button reverts to Connect only after
         // the native-side cleanup actually happened, not optimistically.
+        VpnState.setProxyHandle(0L)
         VpnState.setRunning(false)
         Log.i(TAG, "teardown: done")
     }

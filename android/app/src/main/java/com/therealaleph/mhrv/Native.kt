@@ -78,4 +78,21 @@ object Native {
      * Same check the desktop UI runs — same result format.
      */
     external fun checkUpdate(): String
+
+    /**
+     * Live traffic/usage counters for a running proxy handle. Returns a
+     * JSON blob with the StatsSnapshot fields — or an empty string if the
+     * handle is unknown or the proxy isn't using the Apps Script relay
+     * (google_only / full-only modes).
+     *
+     * Schema (all integer fields unless noted):
+     *   relay_calls, relay_failures, coalesced, bytes_relayed,
+     *   cache_hits, cache_misses, cache_bytes,
+     *   blacklisted_scripts, total_scripts,
+     *   today_calls, today_bytes, today_key (string "YYYY-MM-DD"),
+     *   today_reset_secs (seconds until 00:00 UTC rollover)
+     *
+     * Cheap — just reads atomics. Safe to poll on a second-scale timer.
+     */
+    external fun statsJson(handle: Long): String
 }

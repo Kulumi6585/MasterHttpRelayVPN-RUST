@@ -105,6 +105,19 @@ pub struct DomainFronter {
     /// on the slow path (once per relayed request), so a plain Mutex is
     /// fine.
     per_site: Arc<std::sync::Mutex<HashMap<String, HostStat>>>,
+    /// Daily-scoped counters, reset at 00:00 UTC. Tracks what *this
+    /// mhrv-rs process* has observed today — NOT the authoritative
+    /// Apps Script quota bucket on Google's side (which counts across
+    /// every client hitting the same deployment). Useful as a local
+    /// "budget used today" estimate in the UI.
+    ///
+    /// Both counters rebase to zero the first time any recording call
+    /// crosses a UTC date boundary. `day_key` holds "YYYY-MM-DD" of
+    /// the currently-counted day; when we see a new date we swap and
+    /// clear the counters.
+    today_calls: AtomicU64,
+    today_bytes: AtomicU64,
+    today_key: std::sync::Mutex<String>,
 }
 
 /// Aggregated stats for one remote host.
@@ -236,7 +249,28 @@ impl DomainFronter {
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            today_calls: AtomicU64::new(0),
+            today_bytes: AtomicU64::new(0),
+            today_key: std::sync::Mutex::new(current_utc_day_key()),
         })
+    }
+
+    /// Record one relay call toward the daily budget. Called once per
+    /// outbound Apps Script fetch. Rolls over both daily counters at
+    /// 00:00 UTC.
+    fn record_today(&self, bytes: u64) {
+        let today = current_utc_day_key();
+        // Fast path: same day as what we last saw. No lock.
+        let mut guard = self.today_key.lock().unwrap();
+        if *guard != today {
+            // Date rolled over — reset counters before this call is counted.
+            *guard = today;
+            self.today_calls.store(0, Ordering::Relaxed);
+            self.today_bytes.store(0, Ordering::Relaxed);
+        }
+        drop(guard);
+        self.today_calls.fetch_add(1, Ordering::Relaxed);
+        self.today_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Increment the per-site counters. Called on every logical request
@@ -267,6 +301,20 @@ impl DomainFronter {
 
     pub fn snapshot_stats(&self) -> StatsSnapshot {
         let bl = self.blacklist.lock().unwrap();
+        // Read today_key under lock and cheaply check rollover so the
+        // UI never sees stale "today_calls=1847" on a day where no
+        // traffic has flowed yet (e.g. user left the app open past
+        // midnight UTC).
+        let today_now = current_utc_day_key();
+        let today_key = {
+            let mut guard = self.today_key.lock().unwrap();
+            if *guard != today_now {
+                *guard = today_now.clone();
+                self.today_calls.store(0, Ordering::Relaxed);
+                self.today_bytes.store(0, Ordering::Relaxed);
+            }
+            guard.clone()
+        };
         StatsSnapshot {
             relay_calls: self.relay_calls.load(Ordering::Relaxed),
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
@@ -277,6 +325,10 @@ impl DomainFronter {
             cache_bytes: self.cache.size(),
             blacklisted_scripts: bl.len(),
             total_scripts: self.script_ids.len(),
+            today_calls: self.today_calls.load(Ordering::Relaxed),
+            today_bytes: self.today_bytes.load(Ordering::Relaxed),
+            today_key,
+            today_reset_secs: seconds_until_utc_midnight(),
         }
     }
 
@@ -754,6 +806,10 @@ impl DomainFronter {
             }
         };
         self.bytes_relayed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // Daily-budget counters (reset at 00:00 UTC). Only counts
+        // successful relays — the two error branches above don't reach
+        // here, matching what Google actually billed to quota.
+        self.record_today(bytes.len() as u64);
 
         if let Some(k) = cache_key_opt {
             if let Some(ttl) = parse_ttl(&bytes, url) {
@@ -1406,6 +1462,60 @@ fn normalize_x_graphql_url(url: &str) -> String {
     format!("{}{}{}?{}", scheme, host, path, new_query)
 }
 
+/// "YYYY-MM-DD" of the current UTC date. Used as the daily-reset
+/// boundary for `today_calls` / `today_bytes`. We format manually so
+/// this stays std-only and doesn't pull `time` or `chrono` for a
+/// ~20-line helper.
+fn current_utc_day_key() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = unix_to_ymd_utc(secs);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Seconds until the next 00:00 UTC. Used by the UI to render a
+/// "resets in Xh Ym" countdown without the UI having to import time
+/// libraries. Conservative: if the system clock is broken we return
+/// 0 instead of a huge negative-looking number.
+fn seconds_until_utc_midnight() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day = 86_400u64;
+    let rem = secs % day;
+    if rem == 0 {
+        day
+    } else {
+        day - rem
+    }
+}
+
+/// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a
+/// (year, month, day) tuple, UTC. Standalone so we can stay
+/// std-only — no chrono/time/jiff dependency pulled for one caller.
+///
+/// Algorithm: Howard Hinnant's civil_from_days, widely cited and
+/// simple enough to audit by eye. Works for years 1970–9999 which
+/// we'll outlive.
+fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    // Shift so day 0 is 0000-03-01 (Hinnant's era-based trick).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
 fn extract_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or("");
@@ -1844,7 +1954,7 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     pub relay_calls: u64,
     pub relay_failures: u64,
@@ -1855,6 +1965,17 @@ pub struct StatsSnapshot {
     pub cache_bytes: usize,
     pub blacklisted_scripts: usize,
     pub total_scripts: usize,
+    /// Relay calls attributed to the current UTC day. Resets at 00:00 UTC.
+    /// This is what-this-process-has-done today, not the Google-side bucket.
+    pub today_calls: u64,
+    /// Response bytes from relay calls attributed to the current UTC day.
+    pub today_bytes: u64,
+    /// "YYYY-MM-DD" of the day `today_calls` / `today_bytes` refer to.
+    /// Useful for cross-referencing against Google's dashboard.
+    pub today_key: String,
+    /// Seconds until the next 00:00 UTC rollover. Convenient for the UI
+    /// to render "Resets in Xh Ym" without importing time libraries.
+    pub today_reset_secs: u64,
 }
 
 impl StatsSnapshot {
@@ -1880,6 +2001,32 @@ impl StatsSnapshot {
             self.cache_bytes / 1024,
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
+        )
+    }
+
+    /// Hand-rolled JSON serialization so the Android side can read the
+    /// snapshot via JNI without pulling `serde_derive` through this struct.
+    /// Field names match the Rust side verbatim so Kotlin can `JSONObject`
+    /// parse them directly.
+    pub fn to_json(&self) -> String {
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        format!(
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{}}}"#,
+            self.relay_calls,
+            self.relay_failures,
+            self.coalesced,
+            self.bytes_relayed,
+            self.cache_hits,
+            self.cache_misses,
+            self.cache_bytes,
+            self.blacklisted_scripts,
+            self.total_scripts,
+            self.today_calls,
+            self.today_bytes,
+            esc(&self.today_key),
+            self.today_reset_secs,
         )
     }
 }
@@ -2017,6 +2164,27 @@ impl ServerCertVerifier for NoVerify {
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[test]
+    fn unix_to_ymd_utc_handles_known_epochs() {
+        // Anchors chosen to catch the common off-by-one errors (pre/post
+        // leap day, pre/post epoch, year-end rollover).
+        assert_eq!(unix_to_ymd_utc(0), (1970, 1, 1));                    // epoch
+        assert_eq!(unix_to_ymd_utc(86_399), (1970, 1, 1));               // one sec before day 2
+        assert_eq!(unix_to_ymd_utc(86_400), (1970, 1, 2));               // day 2 starts at midnight
+        assert_eq!(unix_to_ymd_utc(951_782_400), (2000, 2, 29));         // leap day (Feb 29, 2000)
+        assert_eq!(unix_to_ymd_utc(951_868_800), (2000, 3, 1));          // day after leap Feb
+        assert_eq!(unix_to_ymd_utc(1_583_020_800), (2020, 3, 1));        // day after a leap Feb
+        assert_eq!(unix_to_ymd_utc(1_735_689_599), (2024, 12, 31));      // last sec of 2024
+        assert_eq!(unix_to_ymd_utc(1_735_689_600), (2025, 1, 1));        // first sec of 2025
+    }
+
+    #[test]
+    fn seconds_until_utc_midnight_is_bounded() {
+        let n = seconds_until_utc_midnight();
+        // Must be in (0, 86400] for any valid system clock.
+        assert!(n > 0 && n <= 86_400);
+    }
 
     #[test]
     fn filter_forwarded_headers_strips_identity_revealing_headers() {

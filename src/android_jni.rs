@@ -40,6 +40,10 @@ struct Running {
     shutdown: Option<oneshot::Sender<()>>,
     /// Own the runtime so it outlives the server. Dropped last.
     rt: Option<Runtime>,
+    /// Keep an Arc to the DomainFronter so `statsJson(handle)` can read the
+    /// live stats without going through the async server. `None` for
+    /// google-only / full-only configs where the fronter isn't used.
+    fronter: Option<Arc<crate::domain_fronter::DomainFronter>>,
 }
 
 static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -225,6 +229,10 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
             }
         };
 
+        // Grab the fronter Arc BEFORE we move `server` into the async task —
+        // so `statsJson(handle)` can read counters without cross-task plumbing.
+        let fronter = server.fronter();
+
         let (tx, rx) = oneshot::channel::<()>();
 
         rt.spawn(async move {
@@ -239,6 +247,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
             Running {
                 shutdown: Some(tx),
                 rt: Some(rt),
+                fronter,
             },
         );
         handle as jlong
@@ -444,4 +453,32 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
         }
     }));
     env.new_string(result_json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// `Native.statsJson(long handle)` -> String. Returns a JSON blob with the
+/// live `StatsSnapshot` for a running proxy, or an empty string if the
+/// handle is unknown or the proxy has no fronter (google_only / full modes).
+///
+/// Cheap — just reads a handful of atomics. The Kotlin UI polls this on a
+/// timer to render the "Usage today (estimated)" card.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    let out = safe(String::new(), AssertUnwindSafe(|| {
+        let map = match slot_map().lock() {
+            Ok(g) => g,
+            Err(_) => return String::new(),
+        };
+        let Some(running) = map.get(&(handle as u64)) else {
+            return String::new();
+        };
+        let Some(f) = running.fronter.as_ref() else {
+            return String::new();
+        };
+        f.snapshot_stats().to_json()
+    }));
+    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }

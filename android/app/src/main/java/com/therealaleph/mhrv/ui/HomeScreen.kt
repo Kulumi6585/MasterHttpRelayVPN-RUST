@@ -450,6 +450,16 @@ fun HomeScreen(
                 Text(stringResource(R.string.btn_install_mitm))
             }
 
+            // "Usage today (estimated)" — visible only while a proxy is
+            // actually running (the handle is non-zero). Polls the native
+            // stats counter once a second; cheap (just reads atomics on
+            // the Rust side) and gives users a live feel for how close
+            // they are to the Apps Script daily quota. Also links out to
+            // Google's dashboard for the authoritative number — the
+            // client-side estimate only sees what this device relayed,
+            // not what other devices on the same deployment consumed.
+            UsageTodayCard()
+
             CollapsibleSection(title = stringResource(R.string.sec_live_logs), initiallyExpanded = false) {
                 LiveLogPane()
             }
@@ -1311,37 +1321,166 @@ private fun CollapsibleSection(
     }
 }
 
+/**
+ * "Usage today (estimated)" card. Polls `Native.statsJson(handle)` every
+ * second while the proxy is up and renders today's relay calls vs. the
+ * Apps Script free-tier quota (20,000/day), today's bytes, UTC day key,
+ * and a countdown to the 00:00 UTC reset. Also shows a "View quota on
+ * Google" button that opens Google's Apps Script dashboard — the
+ * authoritative number, since the client-side estimate only sees what
+ * this device relayed.
+ *
+ * Hidden when the handle is 0 (proxy not running) or the JSON comes back
+ * empty (google_only / full-only configs don't run a DomainFronter and so
+ * have nothing to report).
+ */
+@Composable
+private fun UsageTodayCard() {
+    // Free-tier Apps Script UrlFetchApp daily quota. Workspace / paid
+    // tiers get 100k but most users are on free.
+    val freeQuotaPerDay = 20_000
+
+    val handle by VpnState.proxyHandle.collectAsState()
+    val isRunning by VpnState.isRunning.collectAsState()
+
+    // Nothing to poll until the proxy is up.
+    if (!isRunning || handle == 0L) return
+
+    var statsJson by remember { mutableStateOf("") }
+    LaunchedEffect(handle) {
+        // Drop any stale snapshot from a previous run.
+        statsJson = ""
+        while (true) {
+            statsJson = withContext(Dispatchers.IO) {
+                runCatching { Native.statsJson(handle) }.getOrDefault("")
+            }
+            delay(1000)
+        }
+    }
+
+    val obj = remember(statsJson) {
+        if (statsJson.isBlank()) null
+        else runCatching { JSONObject(statsJson) }.getOrNull()
+    }
+    // Still booting / not an apps-script config — stay silent.
+    if (obj == null) return
+
+    val todayCalls = obj.optLong("today_calls", 0L)
+    val todayBytes = obj.optLong("today_bytes", 0L)
+    val todayKey = obj.optString("today_key", "")
+    val resetSecs = obj.optLong("today_reset_secs", 0L)
+    val pct = if (freeQuotaPerDay > 0) {
+        (todayCalls.toDouble() / freeQuotaPerDay) * 100.0
+    } else 0.0
+
+    val ctx = LocalContext.current
+
+    Spacer(Modifier.height(8.dp))
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                stringResource(R.string.sec_usage_today),
+                style = MaterialTheme.typography.titleSmall,
+            )
+
+            UsageRow(
+                label = stringResource(R.string.label_calls_today),
+                value = stringResource(
+                    R.string.usage_calls_of_quota,
+                    todayCalls.toInt(),
+                    freeQuotaPerDay,
+                    pct,
+                ),
+            )
+            UsageRow(
+                label = stringResource(R.string.label_bytes_today),
+                value = fmtBytes(todayBytes),
+            )
+            UsageRow(
+                label = stringResource(R.string.label_utc_day),
+                value = todayKey,
+            )
+            UsageRow(
+                label = stringResource(R.string.label_resets_in),
+                value = stringResource(
+                    R.string.usage_resets_hm,
+                    (resetSecs / 3600).toInt(),
+                    ((resetSecs / 60) % 60).toInt(),
+                ),
+            )
+
+            Spacer(Modifier.height(4.dp))
+            TextButton(
+                onClick = {
+                    // Open the Google-side Apps Script quota dashboard in
+                    // the user's browser. Uses ACTION_VIEW with a https://
+                    // URI — the OS picks whatever default browser is set.
+                    val intent = android.content.Intent(
+                        android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse("https://script.google.com/home/usage"),
+                    )
+                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    runCatching { ctx.startActivity(intent) }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.btn_view_quota_on_google))
+            }
+            Text(
+                stringResource(R.string.usage_today_note),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun UsageRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontFamily = FontFamily.Monospace,
+        )
+    }
+}
+
+private fun fmtBytes(b: Long): String {
+    val k = 1024L
+    val m = k * k
+    val g = m * k
+    return when {
+        b >= g -> String.format("%.2f GB", b.toDouble() / g)
+        b >= m -> String.format("%.2f MB", b.toDouble() / m)
+        b >= k -> String.format("%.1f KB", b.toDouble() / k)
+        else -> "$b B"
+    }
+}
+
 @Composable
 private fun HowToUseBody(listenPort: Int) {
     // Used inside the collapsible "How to use" CollapsibleSection. The
     // card + title are provided by the section wrapper, so this body
     // just renders the body text.
+    //
+    // Text is sourced from string resources (values/strings.xml +
+    // values-fa/strings.xml) so the Persian locale gets a translated
+    // guide instead of falling back to English.
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
-                "1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n" +
-                "2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to " +
-                "Downloads/mhrv-ca.crt and the Settings app opens. Use Settings' search bar " +
-                "to find \"CA certificate\", tap that result (NOT \"VPN & app user certificate\" " +
-                "or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You'll be asked to set a " +
-                "screen lock if you don't have one (Android requirement).\n" +
-                "3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If " +
-                "every entry times out, your google_ip is unreachable — replace it with one that " +
-                "resolves locally (e.g. `nslookup www.google.com` on any working device).\n" +
-                "4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the " +
-                "device through the proxy — no per-app setup needed.\n" +
-                "5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn't " +
-                "responding. Redeploy the script, grab the new /exec URL, and paste it above. " +
-                "Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer " +
-                "is failing.\n" +
-                "\n" +
-                "Known limitation — Cloudflare Turnstile (\"Verify you are human\") will loop " +
-                "endlessly on most CF-protected sites. Every Apps Script request uses a rotating " +
-                "Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a " +
-                "Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) " +
-                "tuple the challenge was solved against, so the NEXT request — from a different " +
-                "egress IP — gets re-challenged. Nothing in this app can fix that; it's inherent " +
-                "to Apps Script as a relay. Sites that only gate the initial page load (not every " +
-                "request) will work after one solve.",
+            text = stringResource(R.string.help_how_to_use),
             style = MaterialTheme.typography.bodyMedium,
         )
     }
