@@ -243,6 +243,10 @@ struct FormState {
     /// drop the user's setting. Not currently exposed as a UI control;
     /// users edit `block_quic` directly in `config.json` (Issue #213).
     block_quic: bool,
+    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// users edit `disable_padding` directly when needed (Issue #391).
+    /// Default false (padding active).
+    disable_padding: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -326,6 +330,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
+            disable_padding: c.disable_padding,
         }
     } else {
         FormState {
@@ -354,6 +359,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
             block_quic: false,
+            disable_padding: false,
         }
     };
     (form, load_err)
@@ -500,6 +506,9 @@ impl FormState {
             // control yet). Round-trip through the file so save
             // doesn't drop a user-set true.
             block_quic: self.block_quic,
+            // Issue #391: disable_padding is config-only for now.
+            // Round-trip preserves the user's choice.
+            disable_padding: self.disable_padding,
         })
     }
 }

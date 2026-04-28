@@ -857,11 +857,15 @@ async fn fire_batch(
                     })
                     .sum();
                 f.record_today(response_bytes);
+                let sid_short = &script_id[..script_id.len().min(8)];
                 for (idx, reply) in data_replies {
                     if let Some(resp) = batch_resp.r.get(idx) {
                         let _ = reply.send(Ok((resp.clone(), script_id.clone())));
                     } else {
-                        let _ = reply.send(Err("missing response in batch".into()));
+                        let _ = reply.send(Err(format!(
+                            "missing response in batch from script {}",
+                            sid_short
+                        )));
                     }
                 }
             }
@@ -876,7 +880,30 @@ async fn fire_batch(
                     f.record_timeout_strike(&script_id);
                 }
                 let err_msg = format!("{}", e);
-                tracing::warn!("batch failed: {}", err_msg);
+                let sid_short = &script_id[..script_id.len().min(8)];
+                // Detect the v1.8.0 bad-auth decoy HTML body. The relay layer
+                // wraps any non-JSON response in `BadResponse("no json in
+                // batch response: <body prefix>")`. The decoy body string
+                // `"The script completed but did not return anything"` is
+                // distinctive — Apps Script's stock pages never include it,
+                // and our own `Code.gs` only returns it when AUTH_KEY check
+                // fails. Surfacing this as an actionable hint saves users
+                // (and #404 / #310 sina-b4hrm class issues) hours of
+                // staring at "no json in batch response".
+                if err_msg.contains("The script completed but did not return anything") {
+                    tracing::error!(
+                        "batch failed (script {}): got the v1.8.0 bad-auth decoy — \
+                         your AUTH_KEY in mhrv-rs config does NOT match the AUTH_KEY \
+                         in this deployment's Code.gs. Either fix the mismatch + \
+                         redeploy as a NEW VERSION (Apps Script doesn't auto-pick-up \
+                         AUTH_KEY edits without an explicit redeploy), or set \
+                         DIAGNOSTIC_MODE=true at the top of Code.gs + redeploy to \
+                         see the explicit JSON `unauthorized` error during setup.",
+                        sid_short
+                    );
+                } else {
+                    tracing::warn!("batch failed (script {}): {}", sid_short, err_msg);
+                }
                 for (_, reply) in data_replies {
                     let _ = reply.send(Err(err_msg.clone()));
                 }
@@ -886,7 +913,13 @@ async fn fire_batch(
                 // stronger signal than a per-read timeout — count it the same
                 // way so a truly-stuck deployment exits round-robin fast.
                 f.record_timeout_strike(&script_id);
-                tracing::warn!("batch timed out after {:?} ({} ops)", BATCH_TIMEOUT, n_ops);
+                let sid_short = &script_id[..script_id.len().min(8)];
+                tracing::warn!(
+                    "batch timed out after {:?} (script {}, {} ops)",
+                    BATCH_TIMEOUT,
+                    sid_short,
+                    n_ops
+                );
                 for (_, reply) in data_replies {
                     let _ = reply.send(Err("batch timed out".into()));
                 }

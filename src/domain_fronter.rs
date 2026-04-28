@@ -131,6 +131,10 @@ pub struct DomainFronter {
     today_calls: AtomicU64,
     today_bytes: AtomicU64,
     today_key: std::sync::Mutex<String>,
+    /// Suppress the random `_pad` field that v1.8.0+ adds to outbound
+    /// payloads. Mirrors `Config::disable_padding` (#391). Default false
+    /// (padding active = stronger DPI defense at +25% bandwidth cost).
+    disable_padding: bool,
 }
 
 /// Aggregated stats for one remote host.
@@ -289,6 +293,7 @@ impl DomainFronter {
             today_calls: AtomicU64::new(0),
             today_bytes: AtomicU64::new(0),
             today_key: std::sync::Mutex::new(current_pt_day_key()),
+            disable_padding: config.disable_padding,
         })
     }
 
@@ -1160,7 +1165,9 @@ impl DomainFronter {
         // discards.
         let mut v = serde_json::to_value(&req)?;
         if let Value::Object(map) = &mut v {
-            add_random_pad(map);
+            if !self.disable_padding {
+                add_random_pad(map);
+            }
         }
         Ok(serde_json::to_vec(&v)?)
     }
@@ -1290,7 +1297,9 @@ impl DomainFronter {
         if let Some(d) = data {
             map.insert("d".into(), Value::String(d));
         }
-        add_random_pad(&mut map);
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
         Ok(serde_json::to_vec(&Value::Object(map))?)
     }
 
@@ -1318,7 +1327,9 @@ impl DomainFronter {
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
         map.insert("ops".into(), serde_json::to_value(ops)?);
-        add_random_pad(&mut map);
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
         let payload = serde_json::to_vec(&Value::Object(map))?;
 
         let path = format!("/macros/s/{}/exec", script_id);

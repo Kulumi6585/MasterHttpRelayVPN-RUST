@@ -190,6 +190,21 @@ pub struct Config {
     /// failure modes later. Issue #213.
     #[serde(default)]
     pub block_quic: bool,
+    /// When true, suppress the random `_pad` field that v1.8.0+ adds
+    /// to outbound Apps Script requests for DPI evasion. Default off
+    /// (padding active). Some users on heavily-throttled ISPs find
+    /// the +25% bandwidth cost from padding compounds with the
+    /// throttle to push borderline-working batches into timeouts;
+    /// turning padding off recovers a bit of headroom at the cost of
+    /// length-distribution defense against DPI fingerprinting. Issue
+    /// #391 (EBRAHIM-AM).
+    ///
+    /// Don't flip this on speculatively — for users where Apps Script
+    /// outbound is uncongested, padding is free DPI defense. Only
+    /// turn off if you've measured throughput improvement after the
+    /// flip on your specific ISP path.
+    #[serde(default)]
+    pub disable_padding: bool,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
