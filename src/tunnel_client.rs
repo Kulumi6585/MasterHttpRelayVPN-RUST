@@ -881,24 +881,36 @@ async fn fire_batch(
                 }
                 let err_msg = format!("{}", e);
                 let sid_short = &script_id[..script_id.len().min(8)];
-                // Detect the v1.8.0 bad-auth decoy HTML body. The relay layer
-                // wraps any non-JSON response in `BadResponse("no json in
-                // batch response: <body prefix>")`. The decoy body string
-                // `"The script completed but did not return anything"` is
-                // distinctive — Apps Script's stock pages never include it,
-                // and our own `Code.gs` only returns it when AUTH_KEY check
-                // fails. Surfacing this as an actionable hint saves users
-                // (and #404 / #310 sina-b4hrm class issues) hours of
-                // staring at "no json in batch response".
+                // Detect the body string we ship as the v1.8.0 bad-auth
+                // decoy. v1.8.1 asserted "AUTH_KEY mismatch" outright, but
+                // #404 (w0l4i) found the same body comes back from Apps
+                // Script in 3 other unrelated cases too:
+                //
+                //   1. AUTH_KEY mismatch                 — our intentional decoy
+                //   2. Apps Script execution timeout/    — runtime hit 6-min
+                //      mid-call quota tear                 cap or per-100s quota
+                //   3. Apps Script internal hiccup       — Google-side flake,
+                //                                          serves placeholder
+                //   4. ISP-side response truncation      — #313 pattern, the
+                //                                          response was assembled
+                //                                          but ate an RST mid-flight
+                //
+                // So we surface all four candidates instead of asserting #1.
+                // Users can flip DIAGNOSTIC_MODE=true in Code.gs to disambiguate:
+                // only #1 still returns the decoy in diagnostic mode; the
+                // others return real JSON or different errors.
                 if err_msg.contains("The script completed but did not return anything") {
                     tracing::error!(
-                        "batch failed (script {}): got the v1.8.0 bad-auth decoy — \
-                         your AUTH_KEY in mhrv-rs config does NOT match the AUTH_KEY \
-                         in this deployment's Code.gs. Either fix the mismatch + \
-                         redeploy as a NEW VERSION (Apps Script doesn't auto-pick-up \
-                         AUTH_KEY edits without an explicit redeploy), or set \
-                         DIAGNOSTIC_MODE=true at the top of Code.gs + redeploy to \
-                         see the explicit JSON `unauthorized` error during setup.",
+                        "batch failed (script {}): got the v1.8.0 decoy/placeholder body — \
+                         could be (1) AUTH_KEY mismatch between mhrv-rs config and Code.gs \
+                         (run a direct curl probe against the deployment to verify), \
+                         (2) Apps Script execution timeout or per-100s quota tear (try \
+                         lowering parallel_concurrency in config), (3) Apps Script \
+                         internal hiccup (transient, retry next batch), or (4) ISP-side \
+                         response truncation (#313 pattern, try a different google_ip). \
+                         To distinguish (1) from the rest: set DIAGNOSTIC_MODE=true at \
+                         the top of Code.gs + redeploy as new version — only AUTH_KEY \
+                         mismatch returns this body in diagnostic mode.",
                         sid_short
                     );
                 } else {

@@ -33,25 +33,35 @@ fn main() -> eframe::Result<()> {
     let shared = Arc::new(Shared::default());
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
 
+    // Load the user's saved form first so we can seed the tracing filter
+    // with their saved log level. Otherwise the form's log-level combobox
+    // would only ever take effect via env var or after Save → restart, and
+    // users on the UI binary (issue #401) reasonably expect the saved
+    // config.json `log_level` to apply at boot like it does for the CLI.
+    let (form, load_err) = load_form();
+    let initial_toast = load_err.map(|e| (e, Instant::now()));
+
     // Hook tracing events into the Recent log panel. Without this every
     // tracing::info! / debug! / trace! the proxy emits gets swallowed and
     // the panel only ever shows our manual push_log calls, making the log
     // level selector look useless (issue #12 bug 2).
     //
-    // The env-filter respects RUST_LOG if set, otherwise defaults to info
-    // so users see routing decisions immediately without any knob-turning.
-    // When they start the proxy and Save the config, the log level from the
-    // config is applied to the in-process filter (see on_start below).
-    install_ui_tracing(shared.clone());
+    // Filter precedence (issue #401 fix in v1.8.2):
+    //   1. RUST_LOG env var if set                         — explicit override
+    //   2. Saved config's `log_level` (passed from form)   — what users mean
+    //      when they pick a level in the UI
+    //   3. "info,hyper=warn"                               — sensible default
+    //
+    // Save inside the running UI also installs the new filter via the
+    // reload handle (see `LOG_RELOAD` below), so users don't need to
+    // restart for a config change to take effect.
+    install_ui_tracing(shared.clone(), &form.log_level);
 
     let shared_bg = shared.clone();
     std::thread::Builder::new()
         .name("mhrv-bg".into())
         .spawn(move || background_thread(shared_bg, cmd_rx))
         .expect("failed to spawn background thread");
-
-    let (form, load_err) = load_form();
-    let initial_toast = load_err.map(|e| (e, Instant::now()));
 
     // Pick the renderer. Default is `glow` (OpenGL 2+) because that's
     // what we shipped through v1.0.x and it has the least binary-size
@@ -993,7 +1003,12 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if ui.add(primary_button("Save config")).clicked() {
                     match self.form.to_config().and_then(|c| save_config(&c)) {
-                        Ok(p) => self.toast = Some((format!("Saved to {}", p.display()), Instant::now())),
+                        Ok(p) => {
+                            // Apply the new log level live so users don't have to
+                            // restart for the combobox to take effect (#401).
+                            apply_log_level(&self.form.log_level);
+                            self.toast = Some((format!("Saved to {}", p.display()), Instant::now()));
+                        }
                         Err(e) => self.toast = Some((format!("Save failed: {}", e), Instant::now())),
                     }
                 }
@@ -2193,14 +2208,19 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 /// Install a tracing subscriber that mirrors every log event into the UI's
 /// Recent log panel.
 ///
-/// Respects `RUST_LOG` if set. Otherwise defaults to `info` — which is what
-/// users mean when they pick a non-default log level in the form. (trace /
-/// debug flip too much noise for a local GUI, so the combo-box changes level
-/// live via the `reload` handle that `with_env_filter` gives us but we keep
-/// the default boot-time level at info so first-run behavior is sensible.)
-fn install_ui_tracing(shared: Arc<Shared>) {
+/// Filter precedence (issue #401, v1.8.2):
+///   1. `RUST_LOG` env var, if set
+///   2. The saved form's `log_level` (passed in from the loaded config)
+///   3. `info,hyper=warn` as a sensible default
+///
+/// The constructed filter is wrapped in a `reload::Layer` and the handle
+/// is stashed in `LOG_RELOAD` so that a Save inside the running UI can
+/// reinstall the filter without a restart. See `apply_log_level`.
+fn install_ui_tracing(shared: Arc<Shared>, config_level: &str) {
     use tracing_subscriber::fmt::MakeWriter;
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{reload, EnvFilter};
 
     /// A MakeWriter that pushes each line into the shared log panel.
     struct UiLogWriter {
@@ -2254,17 +2274,69 @@ fn install_ui_tracing(shared: Arc<Shared>) {
         }
     }
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hyper=warn"));
+    // RUST_LOG > config.log_level > "info,hyper=warn"
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let trimmed = config_level.trim();
+        if trimmed.is_empty() {
+            EnvFilter::new("info,hyper=warn")
+        } else {
+            EnvFilter::try_new(trimmed).unwrap_or_else(|_| EnvFilter::new("info,hyper=warn"))
+        }
+    });
+
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+    if LOG_RELOAD.set(reload_handle).is_err() {
+        // Already initialized — install_ui_tracing got called twice. Bail
+        // silently rather than panic; the existing subscriber stays live.
+        return;
+    }
 
     let writer = UiLogWriter { shared };
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(writer)
+        .with_writer(writer);
+
+    let _ = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
         .try_init();
+}
+
+/// Reload handle for the UI's tracing EnvFilter — populated once at startup
+/// by `install_ui_tracing`. `apply_log_level` uses it to swap in a new
+/// filter when the user clicks Save with a different log level (#401).
+static LOG_RELOAD: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Reinstall the tracing filter at runtime. Called from the Save handler
+/// so the user's new `log_level` takes effect without a restart. RUST_LOG
+/// still wins if it was set at process start — explicit override beats
+/// config in both directions.
+fn apply_log_level(level: &str) {
+    use tracing_subscriber::EnvFilter;
+    let Some(handle) = LOG_RELOAD.get() else {
+        return;
+    };
+    if std::env::var_os("RUST_LOG").is_some() {
+        // RUST_LOG was set explicitly at boot — don't silently override.
+        return;
+    }
+    let trimmed = level.trim();
+    let new = if trimmed.is_empty() {
+        EnvFilter::new("info,hyper=warn")
+    } else {
+        match EnvFilter::try_new(trimmed) {
+            Ok(f) => f,
+            Err(_) => return,
+        }
+    };
+    let _ = handle.modify(|f| *f = new);
 }
 
 /// Where we drop downloaded release assets. Prefer the OS user Downloads
