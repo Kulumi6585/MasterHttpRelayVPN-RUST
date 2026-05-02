@@ -12,13 +12,11 @@
 🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced topics)](docs/guide.md)
 🇮🇷 [راه‌اندازی سریع فارسی](#راه‌اندازی-سریع) · [راهنمای کامل (مباحث پیشرفته)](docs/guide.fa.md)
 
-<p align="center"><b>راهنمای تصویری راه اندازی به زبان فارسی</b></p>
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=voCwxgvWR5U" target="_blank" rel="noopener noreferrer">
-    <img src="https://img.youtube.com/vi/voCwxgvWR5U/maxresdefault.jpg" alt="راهنمای راه اندازی mhrv-rs به فارسی" width="560">
-  </a>
+<p align="center" dir="rtl">
+  ۱. <a href="https://www.youtube.com/watch?v=voCwxgvWR5U" target="_blank" rel="noopener noreferrer">راهنمای تصویری راه اندازی به زبان فارسی</a> (YouTube)
+  <br>
+  ۲. <a href="https://kian-irani.github.io/mhrv-setup-full-tunell/" target="_blank" rel="noopener noreferrer">راهنمای جامع متنی راه اندازی به زبان فارسی</a> با تشکر از <a href="https://github.com/KIAN-IRANi" target="_blank" rel="noopener noreferrer">Kian Irani</a>
 </p>
-<p align="center"><a href="https://kian-irani.github.io/mhrv-setup-full-tunell/" target="_blank" rel="noopener noreferrer">راهنمای جامع متنی راه اندازی به زبان فارسی</a> با تشکر از <a href="https://github.com/KIAN-IRANi" target="_blank" rel="noopener noreferrer">Kian Irani</a></p>
 
 ---
 
