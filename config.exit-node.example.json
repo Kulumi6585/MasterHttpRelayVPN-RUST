@@ -27,7 +27,9 @@
       "claude.ai",
       "x.com",
       "grok.com",
-      "openai.com"
+      "openai.com",
+      "aistudio.google.com",
+      "ai.google.dev"
     ]
   }
 }
